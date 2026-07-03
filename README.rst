@@ -43,13 +43,13 @@ A common pattern is a pytest fixture that runs the check on teardown:
 .. code-block:: python
 
     import pytest
-    from refleak import testing
+    from refleak.testing import assert_no_instances
 
 
     @pytest.fixture
     def check_no_leaked_widgets(request):
         yield
-        testing.assert_no_instances(MyWidget, when="test teardown", request=request)
+        assert_no_instances(MyWidget, when="test teardown", request=request)
 
 Comparison to similar packages
 -------------------------------
