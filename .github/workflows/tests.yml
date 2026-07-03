@@ -43,3 +43,5 @@ jobs:
       - run: pytest --tb=short --cov --cov-report=xml --cov-report=html -vvv refleak
       - uses: codecov/codecov-action@v7
         if: success() || failure()
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
