@@ -70,11 +70,12 @@ junit_family = "xunit2"
 line-length = 88
 
 [tool.ruff.lint]
-select = ["A", "C", "D", "E", "F", "W"]
+select = ["A", "B006", "D", "E", "F", "I", "UP", "UP031", "W"]
 ignore = [
   "D100", # Missing docstring in public module
   "D104", # Missing docstring in public package
   "D107", # Missing docstring in __init__
+  "D301", # Use `r"""` if any backslashes in a docstring
   "D413" # Missing blank line after last section
 ]
 extend-select = [

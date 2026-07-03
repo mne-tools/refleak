@@ -14,6 +14,9 @@ class _Leaky:
     """A trivial class to instantiate and (optionally) leak."""
 
 
+_leaked: _Leaky | None = None
+
+
 def test_assert_no_instances_passes_when_clean():
     """No live instances -> no assertion error."""
     obj = _Leaky()
@@ -29,7 +32,7 @@ def test_assert_no_instances_reports_referrer_chain():
         with pytest.raises(AssertionError, match="1 _Leaky @ test"):
             refleak.assert_no_instances(_Leaky, when="test")
     finally:
-        del _leaked
+        _leaked = None
 
 
 def test_assert_no_instances_extra_info():
@@ -42,7 +45,7 @@ def test_assert_no_instances_extra_info():
                 _Leaky, when="test", extra_info=lambda obj: ["custom-marker"]
             )
     finally:
-        del _leaked
+        _leaked = None
 
 
 def test_gc_collect_once_dedupes(request):
