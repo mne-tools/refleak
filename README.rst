@@ -38,6 +38,7 @@ Usage
     gc.collect()
     testing.assert_no_instances(Leaky, when="after test")
 
+
 A common pattern is a pytest fixture that runs the check on teardown:
 
 .. code-block:: python
@@ -50,6 +51,38 @@ A common pattern is a pytest fixture that runs the check on teardown:
     def check_no_leaked_widgets(request):
         yield
         assert_no_instances(MyWidget, when="test teardown", request=request)
+
+When references are held, an AssertionError will be thrown. For example:
+
+.. code-block:: python
+
+    import gc
+    from refleak import testing
+
+    class Leaky:
+        pass
+
+    class ClingyParent:
+        some_dict: dict
+
+    leaked = Leaky()
+    parent = ClingyParent()
+    parent.some_dict = {"leak_1": leaked}  # e.g. accidentally kept alive by some object
+    root_list = ["some_str", leaked, "some_other_str"]
+    del leaked
+    gc.collect()
+    testing.assert_no_instances(Leaky, when="after test")
+
+Would result in:
+
+.. code-block:: console
+
+    __main__.Leaky:
+    ├── dict['leak_1']: dict = <len=1>
+    │   └── __main__.ClingyParent.__dict__['some_dict']: dict = <len=1>
+    │       └── __main__.__dict__['parent']: dict = <len=14>
+    │           └── sys.modules['__main__']: dict = <len=183>
+    └── __main__.root_list[1]: list = <len=3>
 
 Comparison to similar packages
 -------------------------------
