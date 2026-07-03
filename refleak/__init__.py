@@ -6,7 +6,7 @@
 
 from importlib.metadata import version
 
-from ._core import assert_no_instances, gc_collect_once, referrer_chain
+from . import testing
 
 try:
     __version__ = version("refleak")
@@ -16,7 +16,5 @@ del version
 
 __all__ = [
     "__version__",
-    "assert_no_instances",
-    "gc_collect_once",
-    "referrer_chain",
+    "testing",
 ]
