@@ -1,0 +1,110 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools_scm>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "refleak"
+description = "Find out what's still holding a reference to an object that should be dead."
+readme = "README.rst"
+license = {text = "BSD-3-Clause"}
+maintainers = [
+  {name = "Eric Larson", email = "larson.eric.d@gmail.com"}
+]
+requires-python = ">=3.11"
+dynamic = ["version"]
+dependencies = []
+classifiers = [
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: BSD License",
+  "Programming Language :: Python",
+  "Topic :: Software Development",
+  "Topic :: Software Development :: Debuggers",
+  "Topic :: Software Development :: Testing",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX",
+  "Operating System :: Unix",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14"
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest",
+  "pytest-cov"
+]
+
+[project.urls]
+Homepage = "https://github.com/larsoner/refleak"
+Download = "https://github.com/larsoner/refleak"
+
+[tool.check-manifest]
+# .git_archival.txt: setuptools_scm's automatic sdist file-finder relies on
+# a real `.git` directory, which check-manifest's clean-room re-build (a
+# plain file copy, no `.git`) doesn't have, so this one file is invisible to
+# that second pass even though it's present in normal builds (verified via
+# `python -m build`).
+ignore = [
+  ".coveragerc",
+  ".git_archival.txt",
+  ".pre-commit-config.yaml",
+  ".yamllint.yml",
+  "codecov.yml"
+]
+
+[tool.codespell]
+builtin = "clear,rare,informal,names,usage"
+
+[tool.pytest.ini_options]
+addopts = """\
+    --durations=20 --doctest-modules -ra --cov-report= --tb=short \
+    --doctest-ignore-import-errors --junit-xml=junit-results.xml \
+    --capture=sys\
+    """
+junit_family = "xunit2"
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["A", "C", "D", "E", "F", "W"]
+ignore = [
+  "D100", # Missing docstring in public module
+  "D104", # Missing docstring in public package
+  "D107", # Missing docstring in __init__
+  "D413" # Missing blank line after last section
+]
+extend-select = [
+  "D214", # Section is over-indented
+  "D215", # Section underline is over-indented
+  "D404", # First word of the docstring should not be `This`
+  "D405", # Section name should be properly capitalized
+  "D406", # Section name should end with a newline
+  "D407", # Missing dashed underline after section
+  "D408", # Section underline should be in the line following the section's name
+  "D409", # Section underline should match the length of its name
+  "D410", # Missing blank line after section
+  "D411" # Missing blank line before section
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.setuptools]
+zip-safe = false
+include-package-data = false
+
+[tool.setuptools.package-data]
+refleak = ["py.typed"]
+
+[tool.setuptools.packages.find]
+include = ["refleak*"]
+
+[tool.setuptools_scm]
+
+[tool.ty.environment]
+# check against the minimum supported interpreter (see requires-python)
+python-version = "3.11"

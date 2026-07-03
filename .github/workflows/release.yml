@@ -1,0 +1,52 @@
+# Adapted from MNE-BIDS-Pipeline
+
+name: Build
+on:  # yamllint disable-line rule:truthy
+  release:
+    types: [published]
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+      - run: python -m pip install --upgrade pip build twine check-manifest packaging
+      - run: check-manifest -v
+      - run: python -m build --sdist --wheel
+      - run: twine check --strict dist/*
+      - run: |
+          echo "Triggered by: ${{ github.event_name }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist
+
+  # PyPI on release
+  pypi:
+    needs: package
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      id-token: write  # for trusted publishing
+    environment:
+      name: pypi
+      url: https://pypi.org/p/refleak
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - run: ls -lR dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

@@ -1,0 +1,13 @@
+[run]
+branch = True
+source = refleak
+omit =
+    */setup.py
+    */refleak/conftest.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    @abstractmethod
+    @abstractclassmethod
