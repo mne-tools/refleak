@@ -77,6 +77,8 @@ Would result in:
 
 .. code-block:: console
 
+    AssertionError:
+    1 Leaky @ after test:
     __main__.Leaky:
     ├── dict['leak_1']: dict = <len=1>
     │   └── __main__.ClingyParent.__dict__['some_dict']: dict = <len=1>
