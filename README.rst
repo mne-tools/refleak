@@ -50,3 +50,73 @@ A common pattern is a pytest fixture that runs the check on teardown:
     def check_no_leaked_widgets(request):
         yield
         testing.assert_no_instances(MyWidget, when="test teardown", request=request)
+
+Comparison to similar packages
+-------------------------------
+
+There's no shortage of tools for poking at Python's garbage collector; here's
+how ``refleak`` fits in relative to the ones people reach for most. "Monthly
+downloads" is from `PyPI Stats <https://pypistats.org>`__ (July 2026) and
+includes CI/mirror traffic, so treat it as a rough popularity signal rather
+than a count of individual users. "Releases (5y)" counts releases in the
+last five years as a rough maintenance signal.
+
+.. list-table::
+   :header-rows: 1
+
+   * - Package
+     - What it does
+     - Monthly downloads
+     - Latest release
+     - Releases (5y)
+   * - **refleak**
+     - Assert no instances of a class remain alive; on failure, render the
+       referrer chain keeping each survivor alive
+     - new
+     - --
+     - --
+   * - `objgraph <https://pypi.org/project/objgraph/>`__
+     - General-purpose object-graph exploration: count objects by type,
+       diff growth between snapshots, render backref/reference graphs via
+       Graphviz
+     - ~1.1M
+     - 3.6.2 (Oct 2024)
+     - 3
+   * - `Pympler <https://pypi.org/project/Pympler/>`__
+     - Broader memory-profiling suite: object sizing (``asizeof``), live
+       monitoring (``muppy``), and class-level lifetime tracking
+       (``ClassTracker``)
+     - ~5.5M
+     - 1.1 (Jun 2024)
+     - 3
+   * - `guppy3 <https://pypi.org/project/guppy3/>`__ (heapy)
+     - Python 3 port of the classic ``guppy``/``heapy`` heap analysis
+       toolset, with a query language for slicing the whole heap by type,
+       size, or referrer
+     - ~1.2M
+     - 3.1.7 (May 2026)
+     - 7
+   * - `pytest-leaks <https://pypi.org/project/pytest-leaks/>`__
+     - pytest plugin that reruns each test several times and watches
+       ``sys.gettotalrefcount()`` for growth, rather than checking specific
+       classes
+     - ~2.4k
+     - 0.3.1 (Nov 2019)
+     - 0 (unmaintained)
+
+None of the alternatives above do exactly what ``refleak`` does: assert that
+no instances of a *specific class* remain alive and, on failure, explain
+*why* via a rendered referrer chain, in a form meant to be dropped straight
+into a test suite's teardown. ``objgraph`` and ``guppy3``/``heapy`` can
+answer the same "why is this still alive" question (and go well beyond it,
+e.g. full heap graphs and queries), but require driving their APIs
+interactively or wiring up Graphviz output yourself rather than getting an
+assertion with a readable message for free. ``Pympler`` is aimed more at
+memory *sizing* and monitoring over time than one-shot leak assertions.
+``pytest-leaks`` checks for leaks generically (via total refcount growth
+across repeated runs) instead of targeting specific classes, so it can flag
+*that* something leaked without telling you *what* or *why*. If you need
+full heap introspection or memory-size profiling, reach for ``objgraph`` or
+``Pympler``/``guppy3`` instead; if you just want a pytest-friendly assertion
+that a GUI widget, VTK actor, or other object didn't leak, and a readable
+explanation when it did, that's what ``refleak`` is for.
