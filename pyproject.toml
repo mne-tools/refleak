@@ -53,6 +53,7 @@ ignore = [
   ".git_archival.txt",
   ".pre-commit-config.yaml",
   ".yamllint.yml",
+  "CLAUDE.md",
   "codecov.yml"
 ]
 
