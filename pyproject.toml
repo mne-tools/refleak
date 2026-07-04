@@ -39,8 +39,8 @@ test = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/larsoner/refleak"
-Download = "https://github.com/larsoner/refleak"
+Homepage = "https://github.com/mne-tools/refleak"
+Download = "https://github.com/mne-tools/refleak"
 
 [tool.check-manifest]
 # .git_archival.txt: setuptools_scm's automatic sdist file-finder relies on
