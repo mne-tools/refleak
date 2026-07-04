@@ -18,13 +18,16 @@ from refleak.testing._core import (
     _describe_referrer,
     _fullname,
     _key_suffix,
-    _module_global_name,
+    _module_globals_map,
     _safe_repr,
 )
 
 
 class _Leaky:
     """A trivial class to instantiate and (optionally) leak."""
+
+    def __init__(self):
+        self.ref: _Leaky | None = None  # for testing cycles
 
 
 _leaked: _Leaky | None = None
@@ -181,7 +184,7 @@ def test_module_global_list_is_named(reset_holder_list):
         assert_no_instances(_Leaky, when="test")
 
 
-def test_module_global_name_skips_broken_modules(monkeypatch, reset_leaky):
+def test_module_globals_map_skips_broken_modules(monkeypatch, reset_leaky):
     """Broken sys.modules entries (None, exploding __dict__) are skipped."""
 
     class _EvilDict(dict):
@@ -196,11 +199,12 @@ def test_module_global_name_skips_broken_modules(monkeypatch, reset_leaky):
     fake.__dict__ = _EvilDict(some_attr=1)
     monkeypatch.setitem(sys.modules, "refleak_test_none_module", None)
     monkeypatch.setitem(sys.modules, "refleak_test_evil_module", fake)
-    # Not a global anywhere -> full scan (hitting the broken entries) -> None
-    assert _module_global_name(object()) is None
     global _leaked
     _leaked = _Leaky()
-    assert _module_global_name(_leaked) == f"{__name__}._leaked"
+    # building the map survives the broken entries and still finds globals
+    gmap = _module_globals_map()
+    assert gmap[id(_leaked)] == f"{__name__}._leaked"
+    assert id(fake) not in gmap
 
 
 def test_safe_repr_failure():
@@ -341,7 +345,7 @@ def test_instance_attribute_anchor():
     """An instance-attribute holder collapses to its owning instance."""
 
     class _Parent:
-        pass
+        child: _Leaky | None
 
     parent = _Parent()
     parent.child = _Leaky()
@@ -372,6 +376,91 @@ def test_two_leaks_render_with_ids(reset_leaky, reset_holder_list):
     # section headers use the short class name (full name is in the summary)
     assert f"\n_Leaky @ 0x{id(_leaked):x}:" in msg
     assert f"\n_Leaky @ 0x{id(_holder_list[0]):x}:" in msg
+
+
+_saved_exc: Exception | None = None
+
+
+@pytest.fixture
+def reset_saved_exc():
+    """Clear the module-level _saved_exc global on teardown."""
+    yield
+    global _saved_exc
+    _saved_exc = None
+
+
+def test_traceback_frame_leak_detected(reset_saved_exc):
+    """An object alive only via a stored traceback's frame is reported.
+
+    Live-stack frames are machinery and stay hidden, but a frame kept alive
+    by a saved exception is a real (and classic) leak anchor that used to be
+    a silent false negative.
+    """
+
+    def _bad():
+        w = _Leaky()
+        assert w is not None
+        raise RuntimeError("boom")
+
+    global _saved_exc
+    try:
+        _bad()
+    except RuntimeError as exc:
+        _saved_exc = exc
+    with pytest.raises(AssertionError) as exc_info:
+        assert_no_instances(_Leaky, when="test")
+    msg = str(exc_info.value)
+    assert "frame of " in msg
+    assert "_bad: frame = " in msg
+    assert "_saved_exc" in msg  # the walk continues to the actual anchor
+    _saved_exc = None
+    assert_no_instances(_Leaky, when="test")
+
+
+def test_attr_names_for_instance_referrers():
+    """Instance referrers name the attribute holding the referent."""
+
+    class _DictHolder:
+        other: str | None
+        kid: _Leaky | None
+
+    class _SlotHolder:
+        child: _Leaky | None
+        __slots__ = "child"  # str (not tuple) form of __slots__
+
+    class _TwoSlots:
+        second: _Leaky | None
+        __slots__ = ("first", "second")
+
+    obj = _Leaky()
+    d = _DictHolder()
+    d.other = "unrelated"  # scanned (and passed over) before the match
+    d.kid = obj
+    desc, next_obj = _describe_referrer(d, obj)
+    assert "_DictHolder.kid: " in desc
+    assert next_obj is d
+
+    s = _SlotHolder()
+    s.child = obj
+    desc, _ = _describe_referrer(s, obj)
+    assert "_SlotHolder.child: " in desc
+
+    t = _TwoSlots()
+    t.second = obj  # "first" left unset -> AttributeError path
+    desc, _ = _describe_referrer(t, obj)
+    assert "_TwoSlots.second: " in desc
+
+
+def test_empty_when_omitted():
+    """An empty ``when`` doesn't leave a dangling ' @ ' in the message."""
+
+    class _Foo:
+        pass
+
+    _holder = {"key": _Foo()}
+    with pytest.raises(AssertionError, match=r"Found 1 .*_Foo:\n"):
+        assert_no_instances(_Foo)
+    del _holder
 
 
 def test_fullname_module_vs_class():

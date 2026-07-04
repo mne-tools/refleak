@@ -29,7 +29,7 @@ keep them accurate when editing docstrings.
 ## Architecture
 
 Everything lives in `refleak/testing/_core.py`; the `__init__.py` files only
-re-export the three public names (`assert_no_instances`, `gc_collect_once`,
+re-export the four public names (`assert_no_instances`, `gc_collect_once`,
 `referrer_chain`). The referrer-tracing pipeline flows top-down:
 
 - `assert_no_instances` — scans `gc.get_objects()` for `isinstance(obj, cls)`
@@ -55,8 +55,11 @@ Two correctness constraints that pervade the code:
   the lists/dicts/globals the tracer itself is holding as if they were real
   anchors. Callers pass `exclude_ids` (see `assert_no_instances` excluding
   `id(objs)`, `id(ref)`, `id(globals())`), and `_referrer_tree` adds
-  `id(refs)` each level. Frames are always skipped. When adding state that
-  touches traced objects, exclude its id too.
+  `id(refs)` each level. Only *live-stack* frames are skipped (recomputed via
+  `_live_frame_ids()` at each check so the traversal's own frames count);
+  dead-but-referenced frames (stored tracebacks, suspended generators) are
+  real anchors and are reported. When adding state that touches traced
+  objects, exclude its id too.
 - **Reporting must never raise.** Survivors can be half-destroyed native
   objects, so all `repr()` goes through `_safe_repr`, and `isinstance` checks
   are wrapped (weakrefs etc. can raise).
