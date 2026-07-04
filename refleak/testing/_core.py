@@ -7,6 +7,7 @@
 import gc
 import inspect
 import sys
+import types
 
 
 def _fullname(obj):
@@ -14,7 +15,7 @@ def _fullname(obj):
         # Otherwise every module shows up identically as just "module",
         # which is exactly the info we need to tell which one is which.
         return getattr(obj, "__name__", "<unknown module>")
-    klass = obj.__class__
+    klass = obj if inspect.isclass(obj) else obj.__class__
     module = klass.__module__
     name = klass.__qualname__
     if module != "builtins":
@@ -79,14 +80,65 @@ def _dict_owner(d):
     return None
 
 
-def _module_global_name(obj):
-    """Find the "module.attr" name of obj if it is itself a module-level global.
+def _cell_owner(cell):
+    """Find the (function, freevar name) whose closure holds ``cell``, if any.
+
+    Naming the closing-over function and its variable is what makes a leak
+    via an enclosing scope (a classic reference-cycle source) actionable; the
+    cell object itself is anonymous.
+    """
+    for t in gc.get_referrers(cell):
+        if not isinstance(t, tuple):
+            continue
+        for f in gc.get_referrers(t):
+            if inspect.isfunction(f) and f.__closure__ is t:
+                # A tuple only refers to its elements, so cell must be in t
+                # (compare by identity: cells compare by their contents).
+                idx = [id(c) for c in t].index(id(cell))
+                return f, f.__code__.co_freevars[idx]
+    return None, None
+
+
+def _attr_name(obj, referent):
+    """Find the attribute of obj whose value *is* referent, if any.
+
+    On Python >= 3.11 an instance holding referent as an attribute typically
+    shows up as a referrer directly (inline values, or ``__slots__`` on any
+    version) rather than via its ``__dict__``, so without this the failure
+    message would name the holder but not *which* attribute does the holding.
+    """
+    if referent is None:
+        return None
+    try:
+        items = list(vars(obj).items())
+    except TypeError:  # no __dict__ (e.g. __slots__-only)
+        items = list()
+    for klass in type(obj).__mro__:
+        slots = getattr(klass, "__slots__", ())
+        for slot in (slots,) if isinstance(slots, str) else slots:
+            try:
+                items.append((slot, getattr(obj, slot)))
+            except AttributeError:  # unset slot
+                continue
+    for key, val in items:
+        if val is referent:
+            return key
+    return None
+
+
+def _module_globals_map():
+    """Snapshot ``{id(obj): "module.attr"}`` for all module-level globals.
 
     This is what lets a failure message name e.g. a long-lived module-level
     registry (cache, weak-value dict, etc.) directly, which is often the
     actual reason an object outlives a single test/example: a plain
     ``gc.get_referrers`` walk only shows an anonymous ``dict``/``list``.
+    Snapshotting once per chain (rather than rescanning all of
+    ``sys.modules`` for every tree node) keeps rendering fast in processes
+    with many/large modules; storing only ids and names means the map itself
+    keeps nothing alive.
     """
+    out = dict()
     for modname, mod in list(sys.modules.items()):
         d = getattr(mod, "__dict__", None)
         if not d:
@@ -96,19 +148,37 @@ def _module_global_name(obj):
         except Exception:
             continue
         for key, val in items:
-            if val is obj:
-                return f"{modname}.{key}"
-    return None
+            out.setdefault(id(val), f"{modname}.{key}")
+    return out
 
 
-def _describe_referrer(r, referent):
+def _live_frame_ids():
+    """Get ``id()``\\ s of frames currently executing in any thread.
+
+    Objects referenced by these frames are the traversal's own machinery
+    and the caller's live stack -- never leaks. Frames *not* here but still
+    alive (a stored traceback, a suspended generator/coroutine) are real
+    anchors, classically an exception saved somewhere. Computed fresh at
+    each use so the traversal's own frames are always included.
+    """
+    ids = set()
+    for frame in sys._current_frames().values():
+        while frame is not None:
+            ids.add(id(frame))
+            frame = frame.f_back
+    return ids
+
+
+def _describe_referrer(r, referent, global_names=None):
     """Build a "name: type = repr"-style description of r, which refers to referent.
 
     Mirroring a Python variable declaration keeps every referrer kind
     parseable the same way: a name (the best Python-syntax expression for
     reaching ``r``, falling back to its type when nothing better is known),
-    its type, and a repr -- for containers (dict/list/tuple) this is always
-    at least a length summary rather than their (possibly huge) contents.
+    its type (omitted when it would just repeat the name), and a repr -- for
+    containers (dict/list/tuple) this is always at least a length summary
+    rather than their (possibly huge) contents. ``global_names`` is a
+    :func:`_module_globals_map` snapshot (built here if not given).
 
     Returns
     -------
@@ -118,10 +188,21 @@ def _describe_referrer(r, referent):
         What to keep tracing referrers of (``None`` to stop here). This is
         usually ``r`` itself, but for e.g. an instance's ``__dict__`` it's
         the owning instance (tracing the dict's own referrers is normally
-        just uninformative interpreter-internal noise), and for a
-        module-level global it's ``None`` (a named global is already a
-        fully-explained anchor; nothing more useful to say).
+        just uninformative interpreter-internal noise), for a closure cell
+        it's the function closing over it (the ``__closure__`` tuple in
+        between is likewise noise), and for a module-level global it's
+        ``None`` (a named global is already a fully-explained anchor;
+        nothing more useful to say).
     """
+    if global_names is None:
+        global_names = _module_globals_map()
+    if inspect.isframe(r):
+        # Only non-executing frames get here (see _referrer_tree): a frame
+        # kept alive by a stored traceback or a suspended generator really
+        # does anchor its locals.
+        code = r.f_code
+        qual = getattr(code, "co_qualname", code.co_name)  # co_qualname: 3.11+
+        return f"frame of {qual}: frame = {code.co_filename}:{r.f_lineno}", r
     if inspect.ismethod(r):
         name = r.__func__.__qualname__
         return f"{name}: method = {_safe_repr(r.__self__)}", r
@@ -135,8 +216,12 @@ def _describe_referrer(r, referent):
         if owner is not None:
             # e.g. "some.module.SomeClass.__dict__['attr']: dict = <len=1>"
             name = f"{_fullname(owner)}.__dict__{suffix}"
-            return f"{name}: dict = <len={len(r)}>", owner
-        global_name = _module_global_name(r)
+            # A module attribute is a fully-explained anchor: what refers to
+            # the *module* (importers, sys.modules, parent packages) is never
+            # the actionable part, so stop there like for named globals.
+            next_obj = None if inspect.ismodule(owner) else owner
+            return f"{name}: dict = <len={len(r)}>", next_obj
+        global_name = global_names.get(id(r))
         if global_name is not None:
             # e.g. "sys.modules['__main__']: dict = <len=2142>"
             return f"{global_name}{suffix}: dict = <len={len(r)}>", None
@@ -144,24 +229,37 @@ def _describe_referrer(r, referent):
     if isinstance(r, (list, tuple)):
         suffix = _key_suffix(r, referent)
         kind = "list" if isinstance(r, list) else "tuple"
-        global_name = _module_global_name(r)
+        global_name = global_names.get(id(r))
         if global_name is not None:
             return f"{global_name}{suffix}: {kind} = <len={len(r)}>", None
         return f"{kind}{suffix}: {kind} = <len={len(r)}>", r
-    global_name = _module_global_name(r)
+    if isinstance(r, types.CellType):  # a closure variable
+        # A cell's contents *is* the referent (its only reference), so
+        # repeating it here would be redundant; like the other containers,
+        # summarize the closure by length instead.
+        owner, varname = _cell_owner(r)
+        if owner is not None:
+            # e.g. "cb.__closure__['widget']: cell = <closure len=1>"
+            name = f"{owner.__qualname__}.__closure__[{varname!r}]"
+            return f"{name}: cell = <closure len={len(owner.__closure__)}>", owner
+        return f"cell = {_safe_repr(r)}", r
+    # e.g. ".the_widget" when r holds referent as an instance attribute
+    attr = _attr_name(r, referent)
+    suffix = f".{attr}" if attr is not None else ""
+    global_name = global_names.get(id(r))
     if global_name is not None:
-        return f"{global_name}: {_fullname(r)} = {_safe_repr(r)}", None
-    rep = _safe_repr(r)
-    if rep.startswith("<cell at "):  # a closure variable
-        try:
-            rep += f" ({_safe_repr(r.cell_contents)})"
-        except Exception:
-            pass
-    name = _fullname(r)
-    return f"{name}: {name} = {rep}", r
+        return f"{global_name}{suffix}: {_fullname(r)} = {_safe_repr(r)}", None
+    if suffix:
+        name = _fullname(r)
+        return f"{name}{suffix}: {name} = {_safe_repr(r)}", r
+    # Here the best available "name" is just the type, so writing both (e.g.
+    # "generator: generator = ...") would only stutter.
+    return f"{_fullname(r)} = {_safe_repr(r)}", r
 
 
-def _referrer_tree(o, depth, *, max_depth, max_lines, count, excluded, recursed):
+def _referrer_tree(
+    o, depth, *, max_depth, max_lines, count, excluded, recursed, root_id, global_names
+):
     """Recursively build a tree of (description, children) referrer nodes.
 
     ``excluded`` objects (e.g. the huge ``gc.get_objects()`` snapshot) are
@@ -171,6 +269,12 @@ def _referrer_tree(o, depth, *, max_depth, max_lines, count, excluded, recursed)
     *listed* (only from being expanded again). ``count`` is a 1-element list
     used as a mutable counter shared across the whole recursion, so the
     total number of nodes (not just per-level) is capped at ``max_lines``.
+
+    So that a childless node isn't ambiguous, a node whose expansion target
+    was skipped gets a marker: ``(cycle back to 0x...)`` when the chain has
+    come back around to the traced object itself (``root_id``) -- i.e. a
+    reference cycle -- and ``(see above)`` when it was already expanded
+    earlier in the tree.
     """
     nodes = list()
     refs = gc.get_referrers(o)
@@ -183,27 +287,33 @@ def _referrer_tree(o, depth, *, max_depth, max_lines, count, excluded, recursed)
         if count[0] >= max_lines:
             nodes.append(("... (truncated)", []))
             return nodes
-        if inspect.isframe(r) or id(r) in excluded:
+        # Live-stack frames (recomputed here so this traversal's own frames
+        # are included) are machinery, not leaks; dead-but-referenced frames
+        # (stored tracebacks, suspended generators) are real anchors and are
+        # kept.
+        if id(r) in excluded or (inspect.isframe(r) and id(r) in _live_frame_ids()):
             continue
         count[0] += 1
-        desc, next_obj = _describe_referrer(r, o)
+        desc, next_obj = _describe_referrer(r, o, global_names)
         children = list()
-        if (
-            next_obj is not None
-            and id(next_obj) not in recursed
-            and id(next_obj) not in excluded
-            and depth + 1 < max_depth
-        ):
-            recursed.add(id(next_obj))
-            children = _referrer_tree(
-                next_obj,
-                depth + 1,
-                max_depth=max_depth,
-                max_lines=max_lines,
-                count=count,
-                excluded=excluded,
-                recursed=recursed,
-            )
+        if next_obj is not None and id(next_obj) not in excluded:
+            if id(next_obj) == root_id:
+                desc += f" (cycle back to 0x{root_id:x})"
+            elif id(next_obj) in recursed:
+                desc += " (see above)"
+            elif depth + 1 < max_depth:
+                recursed.add(id(next_obj))
+                children = _referrer_tree(
+                    next_obj,
+                    depth + 1,
+                    max_depth=max_depth,
+                    max_lines=max_lines,
+                    count=count,
+                    excluded=excluded,
+                    recursed=recursed,
+                    root_id=root_id,
+                    global_names=global_names,
+                )
         nodes.append((desc, children))
         del r
     del refs
@@ -246,9 +356,13 @@ def referrer_chain(obj, *, max_depth=5, max_lines=40, exclude_ids=()):
     Returns
     -------
     lines : list[str]
-        Rendered tree lines, one referrer per line.
+        Rendered tree lines, one referrer per line. A line ending in
+        ``(cycle back to 0x...)`` reached ``obj`` itself again (a reference
+        cycle); one ending in ``(see above)`` reached something already
+        expanded earlier in the tree.
     has_referrers : bool
-        Whether any (non-excluded, non-frame) referrers were found at all.
+        Whether any (non-excluded, non-live-frame) referrers were found at
+        all.
     """
     excluded = set(exclude_ids)
     recursed = {id(obj)}
@@ -260,17 +374,37 @@ def referrer_chain(obj, *, max_depth=5, max_lines=40, exclude_ids=()):
         count=[0],
         excluded=excluded,
         recursed=recursed,
+        root_id=id(obj),
+        global_names=_module_globals_map(),
     )
     return _render_tree(nodes), len(nodes) > 0
 
 
-def assert_no_instances(cls, when="", *, request=None, objs=None, extra_info=None):
+def _found_summary(n, cls, when):
+    """Build the "Found N module.Class [@ when]:" summary line."""
+    out = f"Found {n} {_fullname(cls)}"
+    if when:
+        out += f" @ {when}"
+    return out + ":"
+
+
+def assert_no_instances(
+    cls,
+    when="",
+    *,
+    request=None,
+    objs=None,
+    extra_info=None,
+    max_depth=5,
+    max_lines=40,
+):
     """Assert that no instances of ``cls`` are still alive.
 
     For any surviving instance, the failure message includes a rendered
     referrer chain (see :func:`referrer_chain`) explaining what's still
     holding a reference to it, which is usually far more actionable than a
-    bare instance count.
+    bare instance count. Each survivor's section is headed by its type and
+    ``id()`` (in hex, to match default object reprs).
 
     Parameters
     ----------
@@ -289,6 +423,12 @@ def assert_no_instances(cls, when="", *, request=None, objs=None, extra_info=Non
         If given, called with each surviving instance to produce extra lines
         (e.g. instance-specific diagnostic state) prepended to its entry in
         the failure message.
+    max_depth : int
+        Maximum number of referrer hops to walk per surviving instance
+        (see :func:`referrer_chain`).
+    max_lines : int
+        Maximum number of tree lines to render per surviving instance
+        (see :func:`referrer_chain`).
     """
     __tracebackhide__ = True
     n = 0
@@ -304,13 +444,22 @@ def assert_no_instances(cls, when="", *, request=None, objs=None, extra_info=Non
         if check:
             extra = list(extra_info(obj)) if extra_info is not None else list()
             lines, has_referrers = referrer_chain(
-                obj, exclude_ids={id(objs), id(ref), id(globals())}
+                obj,
+                max_depth=max_depth,
+                max_lines=max_lines,
+                exclude_ids={id(objs), id(ref), id(globals())},
             )
             if has_referrers:
                 ref.extend(extra)
-                ref.append(f"{_fullname(obj)}:")
+                # id() tags just the survivors themselves (not every tree
+                # node): it distinguishes multiple instances of cls from each
+                # other and can be correlated with "<... object at 0x...>"
+                # reprs elsewhere. The summary line already gives the full
+                # class name, so the short name suffices here (while still
+                # revealing subclasses of cls).
+                ref.append(f"{obj.__class__.__qualname__} @ 0x{id(obj):x}:")
                 ref.extend(lines)
                 n += 1
         del obj
     del objs
-    assert n == 0, f"\n{n} {cls.__name__} @ {when}:\n" + "\n".join(ref)
+    assert n == 0, "\n" + _found_summary(n, cls, when) + "\n" + "\n".join(ref)
