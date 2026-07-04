@@ -7,6 +7,7 @@
 import gc
 import inspect
 import sys
+import types
 
 
 def _fullname(obj):
@@ -14,7 +15,7 @@ def _fullname(obj):
         # Otherwise every module shows up identically as just "module",
         # which is exactly the info we need to tell which one is which.
         return getattr(obj, "__name__", "<unknown module>")
-    klass = obj.__class__
+    klass = obj if inspect.isclass(obj) else obj.__class__
     module = klass.__module__
     name = klass.__qualname__
     if module != "builtins":
@@ -79,6 +80,25 @@ def _dict_owner(d):
     return None
 
 
+def _cell_owner(cell):
+    """Find the (function, freevar name) whose closure holds ``cell``, if any.
+
+    Naming the closing-over function and its variable is what makes a leak
+    via an enclosing scope (a classic reference-cycle source) actionable; the
+    cell object itself is anonymous.
+    """
+    for t in gc.get_referrers(cell):
+        if not isinstance(t, tuple):
+            continue
+        for f in gc.get_referrers(t):
+            if inspect.isfunction(f) and f.__closure__ is t:
+                # A tuple only refers to its elements, so cell must be in t
+                # (compare by identity: cells compare by their contents).
+                idx = [id(c) for c in t].index(id(cell))
+                return f, f.__code__.co_freevars[idx]
+    return None, None
+
+
 def _module_global_name(obj):
     """Find the "module.attr" name of obj if it is itself a module-level global.
 
@@ -107,8 +127,9 @@ def _describe_referrer(r, referent):
     Mirroring a Python variable declaration keeps every referrer kind
     parseable the same way: a name (the best Python-syntax expression for
     reaching ``r``, falling back to its type when nothing better is known),
-    its type, and a repr -- for containers (dict/list/tuple) this is always
-    at least a length summary rather than their (possibly huge) contents.
+    its type (omitted when it would just repeat the name), and a repr -- for
+    containers (dict/list/tuple) this is always at least a length summary
+    rather than their (possibly huge) contents.
 
     Returns
     -------
@@ -118,9 +139,11 @@ def _describe_referrer(r, referent):
         What to keep tracing referrers of (``None`` to stop here). This is
         usually ``r`` itself, but for e.g. an instance's ``__dict__`` it's
         the owning instance (tracing the dict's own referrers is normally
-        just uninformative interpreter-internal noise), and for a
-        module-level global it's ``None`` (a named global is already a
-        fully-explained anchor; nothing more useful to say).
+        just uninformative interpreter-internal noise), for a closure cell
+        it's the function closing over it (the ``__closure__`` tuple in
+        between is likewise noise), and for a module-level global it's
+        ``None`` (a named global is already a fully-explained anchor;
+        nothing more useful to say).
     """
     if inspect.ismethod(r):
         name = r.__func__.__qualname__
@@ -135,7 +158,11 @@ def _describe_referrer(r, referent):
         if owner is not None:
             # e.g. "some.module.SomeClass.__dict__['attr']: dict = <len=1>"
             name = f"{_fullname(owner)}.__dict__{suffix}"
-            return f"{name}: dict = <len={len(r)}>", owner
+            # A module attribute is a fully-explained anchor: what refers to
+            # the *module* (importers, sys.modules, parent packages) is never
+            # the actionable part, so stop there like for named globals.
+            next_obj = None if inspect.ismodule(owner) else owner
+            return f"{name}: dict = <len={len(r)}>", next_obj
         global_name = _module_global_name(r)
         if global_name is not None:
             # e.g. "sys.modules['__main__']: dict = <len=2142>"
@@ -148,20 +175,27 @@ def _describe_referrer(r, referent):
         if global_name is not None:
             return f"{global_name}{suffix}: {kind} = <len={len(r)}>", None
         return f"{kind}{suffix}: {kind} = <len={len(r)}>", r
+    if isinstance(r, types.CellType):  # a closure variable
+        # A cell's contents *is* the referent (its only reference), so
+        # repeating it here would be redundant; like the other containers,
+        # summarize the closure by length instead.
+        owner, varname = _cell_owner(r)
+        if owner is not None:
+            # e.g. "cb.__closure__['widget']: cell = <closure len=1>"
+            name = f"{owner.__qualname__}.__closure__[{varname!r}]"
+            return f"{name}: cell = <closure len={len(owner.__closure__)}>", owner
+        return f"cell = {_safe_repr(r)}", r
     global_name = _module_global_name(r)
     if global_name is not None:
         return f"{global_name}: {_fullname(r)} = {_safe_repr(r)}", None
-    rep = _safe_repr(r)
-    if rep.startswith("<cell at "):  # a closure variable
-        try:
-            rep += f" ({_safe_repr(r.cell_contents)})"
-        except Exception:
-            pass
-    name = _fullname(r)
-    return f"{name}: {name} = {rep}", r
+    # Here the best available "name" is just the type, so writing both (e.g.
+    # "generator: generator = ...") would only stutter.
+    return f"{_fullname(r)} = {_safe_repr(r)}", r
 
 
-def _referrer_tree(o, depth, *, max_depth, max_lines, count, excluded, recursed):
+def _referrer_tree(
+    o, depth, *, max_depth, max_lines, count, excluded, recursed, root_id
+):
     """Recursively build a tree of (description, children) referrer nodes.
 
     ``excluded`` objects (e.g. the huge ``gc.get_objects()`` snapshot) are
@@ -171,6 +205,12 @@ def _referrer_tree(o, depth, *, max_depth, max_lines, count, excluded, recursed)
     *listed* (only from being expanded again). ``count`` is a 1-element list
     used as a mutable counter shared across the whole recursion, so the
     total number of nodes (not just per-level) is capped at ``max_lines``.
+
+    So that a childless node isn't ambiguous, a node whose expansion target
+    was skipped gets a marker: ``(cycle back to 0x...)`` when the chain has
+    come back around to the traced object itself (``root_id``) -- i.e. a
+    reference cycle -- and ``(see above)`` when it was already expanded
+    earlier in the tree.
     """
     nodes = list()
     refs = gc.get_referrers(o)
@@ -188,22 +228,23 @@ def _referrer_tree(o, depth, *, max_depth, max_lines, count, excluded, recursed)
         count[0] += 1
         desc, next_obj = _describe_referrer(r, o)
         children = list()
-        if (
-            next_obj is not None
-            and id(next_obj) not in recursed
-            and id(next_obj) not in excluded
-            and depth + 1 < max_depth
-        ):
-            recursed.add(id(next_obj))
-            children = _referrer_tree(
-                next_obj,
-                depth + 1,
-                max_depth=max_depth,
-                max_lines=max_lines,
-                count=count,
-                excluded=excluded,
-                recursed=recursed,
-            )
+        if next_obj is not None and id(next_obj) not in excluded:
+            if id(next_obj) == root_id:
+                desc += f" (cycle back to 0x{root_id:x})"
+            elif id(next_obj) in recursed:
+                desc += " (see above)"
+            elif depth + 1 < max_depth:
+                recursed.add(id(next_obj))
+                children = _referrer_tree(
+                    next_obj,
+                    depth + 1,
+                    max_depth=max_depth,
+                    max_lines=max_lines,
+                    count=count,
+                    excluded=excluded,
+                    recursed=recursed,
+                    root_id=root_id,
+                )
         nodes.append((desc, children))
         del r
     del refs
@@ -246,7 +287,10 @@ def referrer_chain(obj, *, max_depth=5, max_lines=40, exclude_ids=()):
     Returns
     -------
     lines : list[str]
-        Rendered tree lines, one referrer per line.
+        Rendered tree lines, one referrer per line. A line ending in
+        ``(cycle back to 0x...)`` reached ``obj`` itself again (a reference
+        cycle); one ending in ``(see above)`` reached something already
+        expanded earlier in the tree.
     has_referrers : bool
         Whether any (non-excluded, non-frame) referrers were found at all.
     """
@@ -260,6 +304,7 @@ def referrer_chain(obj, *, max_depth=5, max_lines=40, exclude_ids=()):
         count=[0],
         excluded=excluded,
         recursed=recursed,
+        root_id=id(obj),
     )
     return _render_tree(nodes), len(nodes) > 0
 
@@ -270,7 +315,8 @@ def assert_no_instances(cls, when="", *, request=None, objs=None, extra_info=Non
     For any surviving instance, the failure message includes a rendered
     referrer chain (see :func:`referrer_chain`) explaining what's still
     holding a reference to it, which is usually far more actionable than a
-    bare instance count.
+    bare instance count. Each survivor's section is headed by its type and
+    ``id()`` (in hex, to match default object reprs).
 
     Parameters
     ----------
@@ -308,9 +354,15 @@ def assert_no_instances(cls, when="", *, request=None, objs=None, extra_info=Non
             )
             if has_referrers:
                 ref.extend(extra)
-                ref.append(f"{_fullname(obj)}:")
+                # id() tags just the survivors themselves (not every tree
+                # node): it distinguishes multiple instances of cls from each
+                # other and can be correlated with "<... object at 0x...>"
+                # reprs elsewhere. The summary line already gives the full
+                # class name, so the short name suffices here (while still
+                # revealing subclasses of cls).
+                ref.append(f"{obj.__class__.__qualname__} @ 0x{id(obj):x}:")
                 ref.extend(lines)
                 n += 1
         del obj
     del objs
-    assert n == 0, f"\n{n} {cls.__name__} @ {when}:\n" + "\n".join(ref)
+    assert n == 0, f"\nFound {n} {_fullname(cls)} @ {when}:\n" + "\n".join(ref)

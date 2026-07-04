@@ -1,0 +1,75 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Overview
+
+`refleak` is a small, dependency-free library for finding what still holds a
+reference to an object that should be dead. The public entry point is
+`refleak.testing.assert_no_instances(cls, when=...)`, which asserts that no
+instances of `cls` survive `gc.collect()` and, on failure, renders a
+box-drawing referrer chain explaining *why* each survivor is still alive. It
+was extracted from `mne.utils.misc._assert_no_instances` and targets test
+teardown for GUI/native-object leaks (Qt widgets, VTK actors, PyVista).
+
+## Commands
+
+```bash
+pip install -e .[test]      # install with test deps (pytest, pytest-cov)
+pytest refleak              # run the full suite (config in pyproject.toml)
+pytest refleak/testing/tests/test_core.py::test_assert_no_instances  # single test
+pre-commit run --all-files  # ruff (check+format), ty, yamllint, toml-sort, codespell
+ty check                    # type-check only (against Python 3.10, the minimum)
+```
+
+Note: `pytest` runs with `--doctest-modules`, so docstring examples in
+`_core.py` (and the referrer-chain output shown there) are executed as tests —
+keep them accurate when editing docstrings.
+
+## Architecture
+
+Everything lives in `refleak/testing/_core.py`; the `__init__.py` files only
+re-export the three public names (`assert_no_instances`, `gc_collect_once`,
+`referrer_chain`). The referrer-tracing pipeline flows top-down:
+
+- `assert_no_instances` — scans `gc.get_objects()` for `isinstance(obj, cls)`
+  survivors, calls `referrer_chain` on each, and builds the assertion message.
+- `referrer_chain` — public tracer: walks `gc.get_referrers` up to `max_depth`
+  hops / `max_lines` nodes and returns rendered lines.
+- `_referrer_tree` — the recursion. Shared mutable state threaded through the
+  call: `count` (1-element list, a global node cap), `excluded` (ids never
+  shown/recursed, e.g. the traversal's own containers), `recursed` (ids already
+  expanded, to break reference cycles).
+- `_describe_referrer` — formats one referrer as `name: type = repr` and
+  decides `next_obj` (what to recurse into next, or `None` to stop). It
+  collapses noise: an instance `__dict__` is reported as its owning instance,
+  a closure cell is reported as `func.__closure__['varname']` and recursion
+  continues from the owning function (skipping the anonymous closure tuple),
+  and a module-level global or module attribute is named directly
+  (`module.attr` / `module.__dict__['attr']`) and stops the walk — who holds
+  the *module* is never the actionable part.
+
+Two correctness constraints that pervade the code:
+
+- **The traversal must exclude its own state.** `gc.get_referrers` will report
+  the lists/dicts/globals the tracer itself is holding as if they were real
+  anchors. Callers pass `exclude_ids` (see `assert_no_instances` excluding
+  `id(objs)`, `id(ref)`, `id(globals())`), and `_referrer_tree` adds
+  `id(refs)` each level. Frames are always skipped. When adding state that
+  touches traced objects, exclude its id too.
+- **Reporting must never raise.** Survivors can be half-destroyed native
+  objects, so all `repr()` goes through `_safe_repr`, and `isinstance` checks
+  are wrapped (weakrefs etc. can raise).
+
+`gc_collect_once(request)` deduplicates `gc.collect()` per pytest test item
+(via a `_refleak_gc_collected` attr on the node) because collect cost scales
+with total tracked objects and multiple teardown fixtures would otherwise each
+pay it.
+
+## Conventions
+
+- Python >= 3.10; no runtime dependencies (pytest is only referenced via an
+  optional `request` argument, never imported).
+- Line length 88; ruff enforces pep257 docstrings. Every function has a
+  docstring; private helpers are prefixed `_`.
+- Version is derived from git tags via `setuptools_scm` (no hardcoded version).

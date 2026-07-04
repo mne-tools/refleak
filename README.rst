@@ -78,12 +78,11 @@ Would result in:
 .. code-block:: console
 
     AssertionError:
-    1 Leaky @ after test:
-    __main__.Leaky:
+    Found 1 __main__.Leaky @ after test:
+    Leaky @ 0x102fe3e00:
     ├── dict['leak_1']: dict = <len=1>
     │   └── __main__.ClingyParent.__dict__['some_dict']: dict = <len=1>
-    │       └── __main__.__dict__['parent']: dict = <len=14>
-    │           └── sys.modules['__main__']: dict = <len=183>
+    │       └── __main__.__dict__['parent']: dict = <len=15>
     └── __main__.root_list[1]: list = <len=3>
 
 Comparison to similar packages
