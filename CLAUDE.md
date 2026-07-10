@@ -59,7 +59,14 @@ top-down:
   continues from the owning function (skipping the anonymous closure tuple),
   and a module-level global or module attribute is named directly
   (`module.attr` / `module.__dict__['attr']`) and stops the walk — who holds
-  the *module* is never the actionable part.
+  the *module* is never the actionable part. `__dict__` owner attribution
+  falls back to scanning the caller's `objs` snapshot because C-extension
+  instances (VTK wrappers) don't visit their attribute dict in
+  `tp_traverse`, hiding the owner from `gc.get_referrers`; a still-unowned
+  dict previews its keys (often the only clue to the owning class of a VTK
+  "ghost" `__dict__` whose wrapper already died), and any expanded node with
+  zero visible referrers is marked `(no gc-visible referrers)` — the anchor
+  is outside the Python heap (e.g. a C++-side reference).
 
 Two correctness constraints that pervade the code:
 
