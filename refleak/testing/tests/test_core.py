@@ -498,3 +498,9 @@ def test_snapshot_objs_extra_info_and_empty_when():
         snap.assert_no_new(when="test", extra_info=lambda obj: ["custom-marker"])
     with pytest.raises(AssertionError, match=r"Found 1 new .*\._Leaky object:\n"):
         snap.assert_no_new(objs=[_leaked])
+    # a caller-provided objs= at construction is what gets recorded
+    snap_pre = Snapshot(_Leaky, objs=[_leaked])
+    snap_pre.assert_no_new(when="test")  # the leak pre-dates snap_pre
+    snap_empty = Snapshot(_Leaky, objs=[])
+    with pytest.raises(AssertionError, match="Found 1 new"):
+        snap_empty.assert_no_new(when="test")
