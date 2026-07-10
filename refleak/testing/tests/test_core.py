@@ -4,6 +4,7 @@
 #
 # License: BSD-3-Clause
 
+import gc
 import importlib
 import importlib.metadata
 import sys
@@ -33,6 +34,7 @@ class _Leaky:
 _leaked: _Leaky | None = None
 _holder_list: list | None = None
 _holder_dict: dict | None = None
+_hidden_dict: dict | None = None
 _saved_exc: Exception | None = None
 
 
@@ -40,8 +42,22 @@ _saved_exc: Exception | None = None
 def _reset_globals():
     """Clear every module-level leak-holder global on teardown."""
     yield
-    global _leaked, _holder_list, _holder_dict, _saved_exc
-    _leaked = _holder_list = _holder_dict = _saved_exc = None
+    global _leaked, _holder_list, _holder_dict, _hidden_dict, _saved_exc
+    _leaked = _holder_list = _holder_dict = _hidden_dict = _saved_exc = None
+
+
+class _GhostlyOwner:
+    """Mimic a C-extension instance whose tp_traverse skips its __dict__.
+
+    VTK wrappers really behave this way: ``obj.__dict__`` works, but the
+    owner never shows up in ``gc.get_referrers(obj.__dict__)``.
+    """
+
+    __slots__ = ()
+
+    @property
+    def __dict__(self):
+        return _hidden_dict
 
 
 def test_assert_no_instances_reports_referrer_chain():
@@ -424,6 +440,35 @@ def test_fullname_module_vs_class():
     assert _fullname(testing) == "refleak.testing"
     assert _fullname(_Leaky()) == f"{__name__}._Leaky"
     assert _fullname(_Leaky) == f"{__name__}._Leaky"  # classes name themselves
+
+
+def test_dict_owner_objs_scan_fallback():
+    """A dict owner invisible to gc.get_referrers is found by scanning objs."""
+    global _hidden_dict
+    owner = _GhostlyOwner()
+    _hidden_dict = {"child": _Leaky()}
+    # the referrers-based scan really cannot see the owner
+    assert not any(r is owner for r in gc.get_referrers(_hidden_dict))
+    with pytest.raises(AssertionError) as exc_info:
+        assert_no_instances(_Leaky, when="test")
+    msg = str(exc_info.value)
+    assert f"{__name__}._GhostlyOwner.__dict__['child']: dict = <len=1>" in msg
+    del owner
+
+
+def test_orphan_dict_keys_preview_and_dead_end():
+    """An unowned dict previews its keys and marks the gc-invisible anchor."""
+    obj = _Leaky()
+    d = {"the_attr": obj, "other_attr": 1}
+    lines, has_referrers = testing.referrer_chain(obj)
+    assert has_referrers
+    text = "\n".join(lines)
+    # sibling keys hint at whose attribute dict this might be (e.g. a VTK
+    # "ghost" __dict__ whose owner's Python wrapper is already dead)
+    assert "dict['the_attr']: dict = <len=2, keys=['the_attr', 'other_attr']>" in text
+    # the dict itself has no gc-visible referrers (only the live test frame)
+    assert "(no gc-visible referrers)" in text
+    del d
 
 
 def test_snapshot_lifecycle():

@@ -72,12 +72,44 @@ def _safe_repr(obj, *, maxlen=100):
     return rep[:maxlen].replace("\n", " ")
 
 
-def _dict_owner(d):
-    """Find the object whose __dict__ (or similar) *is* d, if any."""
+def _dict_owner(d, objs=None):
+    """Find the object whose __dict__ (or similar) *is* d, if any.
+
+    C-extension instances (e.g. VTK wrappers) may not visit their attribute
+    dict in ``tp_traverse``, leaving the owner invisible to
+    ``gc.get_referrers``; when ``objs`` (a ``gc.get_objects()`` snapshot) is
+    available, fall back to scanning it for the owner directly. Both scans
+    tolerate objects whose ``__dict__`` access raises.
+    """
     for o in gc.get_referrers(d):
-        if getattr(o, "__dict__", None) is d:
-            return o
+        try:
+            if getattr(o, "__dict__", None) is d:
+                return o
+        except Exception:
+            continue
+    for o in objs if objs is not None else ():
+        try:
+            if getattr(o, "__dict__", None) is d:
+                return o
+        except Exception:
+            continue
     return None
+
+
+def _dict_keys_preview(d, maxkeys=4):
+    """Summarize a dict's keys, to hint at whose attribute dict it might be.
+
+    For an "orphaned" instance ``__dict__`` -- e.g. one kept alive by VTK's
+    ghost mechanism after its owner's Python wrapper died -- the attribute
+    names are often the only clue left to identify the owning class.
+    """
+    keys = list()
+    for i, k in enumerate(d):
+        if i >= maxkeys:
+            keys.append("...")
+            break
+        keys.append(_safe_repr(k, maxlen=40))
+    return "[" + ", ".join(keys) + "]"
 
 
 def _cell_owner(cell):
@@ -169,7 +201,7 @@ def _live_frame_ids():
     return ids
 
 
-def _describe_referrer(r, referent, global_names=None):
+def _describe_referrer(r, referent, global_names=None, objs=None):
     """Build a "name: type = repr"-style description of r, which refers to referent.
 
     Mirroring a Python variable declaration keeps every referrer kind
@@ -178,7 +210,9 @@ def _describe_referrer(r, referent, global_names=None):
     its type (omitted when it would just repeat the name), and a repr -- for
     containers (dict/list/tuple) this is always at least a length summary
     rather than their (possibly huge) contents. ``global_names`` is a
-    :func:`_module_globals_map` snapshot (built here if not given).
+    :func:`_module_globals_map` snapshot (built here if not given), and
+    ``objs`` an optional ``gc.get_objects()`` snapshot for owner attribution
+    (see :func:`_dict_owner`).
 
     Returns
     -------
@@ -212,7 +246,7 @@ def _describe_referrer(r, referent, global_names=None):
         return f"{_fullname(r)}: module = {_safe_repr(r)}", r
     if isinstance(r, dict):
         suffix = _key_suffix(r, referent)
-        owner = _dict_owner(r)
+        owner = _dict_owner(r, objs)
         if owner is not None:
             # e.g. "some.module.SomeClass.__dict__['attr']: dict = <len=1>"
             name = f"{_fullname(owner)}.__dict__{suffix}"
@@ -225,7 +259,10 @@ def _describe_referrer(r, referent, global_names=None):
         if global_name is not None:
             # e.g. "sys.modules['__main__']: dict = <len=2142>"
             return f"{global_name}{suffix}: dict = <len={len(r)}>", None
-        return f"dict{suffix}: dict = <len={len(r)}>", r
+        # Anonymous dict: preview the sibling keys (unless the suffix already
+        # showed the only one) to hint at whose attribute dict this might be.
+        preview = f", keys={_dict_keys_preview(r)}" if len(r) > 1 else ""
+        return f"dict{suffix}: dict = <len={len(r)}{preview}>", r
     if isinstance(r, (list, tuple)):
         suffix = _key_suffix(r, referent)
         kind = "list" if isinstance(r, list) else "tuple"
@@ -258,7 +295,17 @@ def _describe_referrer(r, referent, global_names=None):
 
 
 def _referrer_tree(
-    o, depth, *, max_depth, max_lines, count, excluded, recursed, root_id, global_names
+    o,
+    depth,
+    *,
+    max_depth,
+    max_lines,
+    count,
+    excluded,
+    recursed,
+    root_id,
+    global_names,
+    objs,
 ):
     """Recursively build a tree of (description, children) referrer nodes.
 
@@ -274,7 +321,11 @@ def _referrer_tree(
     was skipped gets a marker: ``(cycle back to 0x...)`` when the chain has
     come back around to the traced object itself (``root_id``) -- i.e. a
     reference cycle -- and ``(see above)`` when it was already expanded
-    earlier in the tree.
+    earlier in the tree. A node that *was* expanded but has no gc-visible
+    referrers at all gets ``(no gc-visible referrers)``: its anchor lives
+    outside the Python heap (e.g. a C++-side reference such as VTK's ghost
+    mechanism), which is exactly the hint needed to stop looking for a
+    Python culprit.
     """
     nodes = list()
     refs = gc.get_referrers(o)
@@ -294,7 +345,7 @@ def _referrer_tree(
         if id(r) in excluded or (inspect.isframe(r) and id(r) in _live_frame_ids()):
             continue
         count[0] += 1
-        desc, next_obj = _describe_referrer(r, o, global_names)
+        desc, next_obj = _describe_referrer(r, o, global_names, objs)
         children = list()
         if next_obj is not None and id(next_obj) not in excluded:
             if id(next_obj) == root_id:
@@ -313,7 +364,10 @@ def _referrer_tree(
                     recursed=recursed,
                     root_id=root_id,
                     global_names=global_names,
+                    objs=objs,
                 )
+                if not children:
+                    desc += " (no gc-visible referrers)"
         nodes.append((desc, children))
         del r
     del refs
@@ -331,7 +385,7 @@ def _render_tree(nodes, prefix=""):
     return lines
 
 
-def referrer_chain(obj, *, max_depth=5, max_lines=40, exclude_ids=()):
+def referrer_chain(obj, *, max_depth=5, max_lines=40, exclude_ids=(), objs=None):
     """Describe, recursively, what holds references to obj.
 
     Referrers are walked up to ``max_depth`` hops and rendered as a tree, so
@@ -352,6 +406,11 @@ def referrer_chain(obj, *, max_depth=5, max_lines=40, exclude_ids=()):
         ``id()``\\ s of objects to treat as if they don't exist (e.g. any
         containers the caller itself is using to hold state during the
         traversal).
+    objs : list | None
+        The result of ``gc.get_objects()``, if already computed by the
+        caller. Used to attribute an instance ``__dict__`` to its owner
+        when the owner's ``tp_traverse`` doesn't visit the dict (e.g. VTK
+        wrappers), which hides it from ``gc.get_referrers``.
 
     Returns
     -------
@@ -359,7 +418,9 @@ def referrer_chain(obj, *, max_depth=5, max_lines=40, exclude_ids=()):
         Rendered tree lines, one referrer per line. A line ending in
         ``(cycle back to 0x...)`` reached ``obj`` itself again (a reference
         cycle); one ending in ``(see above)`` reached something already
-        expanded earlier in the tree.
+        expanded earlier in the tree; one ending in ``(no gc-visible
+        referrers)`` was expanded but nothing in the Python heap refers to
+        it -- its anchor is outside Python (e.g. a C++-side reference).
     has_referrers : bool
         Whether any (non-excluded, non-live-frame) referrers were found at
         all.
@@ -376,6 +437,7 @@ def referrer_chain(obj, *, max_depth=5, max_lines=40, exclude_ids=()):
         recursed=recursed,
         root_id=id(obj),
         global_names=_module_globals_map(),
+        objs=objs,
     )
     return _render_tree(nodes), len(nodes) > 0
 
@@ -427,6 +489,7 @@ def _build_report(survivors, *, objs, extra_info, max_depth, max_lines):
             max_depth=max_depth,
             max_lines=max_lines,
             exclude_ids={id(objs), id(survivors), id(ref), id(globals())},
+            objs=objs,
         )
         if has_referrers:
             ref.extend(extra)
