@@ -85,6 +85,35 @@ Would result in:
     │       └── __main__.__dict__['parent']: dict = <len=15>
     └── __main__.root_list[1]: list = <len=3>
 
+Snapshots: only flag *new* instances
+------------------------------------
+
+``assert_no_instances`` requires that *zero* instances exist, which is too
+strict when some legitimately pre-date the code under test -- for example
+VTK objects held by a plotting theme or a module-level cache. ``Snapshot``
+records the matching objects that already exist so that only ones created
+afterwards (and still alive) are reported:
+
+.. code-block:: python
+
+    import pytest
+    from refleak.testing import Snapshot
+
+
+    @pytest.fixture(autouse=True)
+    def check_vtk_gc(request):
+        """Ensure no VTK objects created during a test outlive it."""
+
+        def is_vtk(obj):
+            return obj.__class__.__name__.startswith("vtk")
+
+        snap = Snapshot(is_vtk, label="VTK")
+        yield
+        snap.assert_no_new(when="test teardown", request=request)
+
+``match`` can be a type, a tuple of types, or a predicate callable, and
+failures render the same referrer chains as ``assert_no_instances``.
+
 Comparison to similar packages
 -------------------------------
 

@@ -5,12 +5,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Overview
 
 `refleak` is a small, dependency-free library for finding what still holds a
-reference to an object that should be dead. The public entry point is
+reference to an object that should be dead. The main entry points are
 `refleak.testing.assert_no_instances(cls, when=...)`, which asserts that no
-instances of `cls` survive `gc.collect()` and, on failure, renders a
-box-drawing referrer chain explaining *why* each survivor is still alive. It
-was extracted from `mne.utils.misc._assert_no_instances` and targets test
-teardown for GUI/native-object leaks (Qt widgets, VTK actors, PyVista).
+instances of `cls` survive `gc.collect()`, and `refleak.testing.Snapshot`,
+which records already-existing matching objects up front so only *new*
+survivors are flagged (`snap = Snapshot(match)` ... `snap.assert_no_new()`).
+On failure both render a box-drawing referrer chain explaining *why* each
+survivor is still alive. It was extracted from
+`mne.utils.misc._assert_no_instances` and targets test teardown for
+GUI/native-object leaks (Qt widgets, VTK actors, PyVista).
 
 ## Commands
 
@@ -29,11 +32,20 @@ keep them accurate when editing docstrings.
 ## Architecture
 
 Everything lives in `refleak/testing/_core.py`; the `__init__.py` files only
-re-export the four public names (`assert_no_instances`, `gc_collect_once`,
-`referrer_chain`). The referrer-tracing pipeline flows top-down:
+re-export the four public names (`Snapshot`, `assert_no_instances`,
+`gc_collect_once`, `referrer_chain`). The referrer-tracing pipeline flows
+top-down:
 
 - `assert_no_instances` — scans `gc.get_objects()` for `isinstance(obj, cls)`
-  survivors, calls `referrer_chain` on each, and builds the assertion message.
+  survivors and asserts there are none.
+- `Snapshot` — records `id()`s of matching objects at construction (types use
+  `isinstance`, anything else is a predicate callable); `assert_no_new()`
+  re-scans and asserts nothing matching appeared since and survived. Stores
+  only ids (pins nothing alive); the documented caveat is id reuse (false
+  negatives only), minimized by the constructor's `gc.collect()`.
+- Both share `_match_objects` (a raising match check counts as a miss) and
+  `_build_report` (per-survivor `referrer_chain` + message lines; survivors
+  with no non-excluded referrers don't count).
 - `referrer_chain` — public tracer: walks `gc.get_referrers` up to `max_depth`
   hops / `max_lines` nodes and returns rendered lines.
 - `_referrer_tree` — the recursion. Shared mutable state threaded through the

@@ -13,7 +13,7 @@ import pytest
 
 import refleak
 from refleak import testing
-from refleak.testing import assert_no_instances
+from refleak.testing import Snapshot, assert_no_instances
 from refleak.testing._core import (
     _describe_referrer,
     _fullname,
@@ -31,35 +31,28 @@ class _Leaky:
 
 
 _leaked: _Leaky | None = None
+_holder_list: list | None = None
+_holder_dict: dict | None = None
+_saved_exc: Exception | None = None
 
 
-@pytest.fixture
-def reset_leaky():
-    """Clear the module-level _leaked global on teardown."""
+@pytest.fixture(autouse=True)
+def _reset_globals():
+    """Clear every module-level leak-holder global on teardown."""
     yield
-    global _leaked
-    _leaked = None
+    global _leaked, _holder_list, _holder_dict, _saved_exc
+    _leaked = _holder_list = _holder_dict = _saved_exc = None
 
 
-def test_assert_no_instances_passes_when_clean():
-    """No live instances -> no assertion error."""
+def test_assert_no_instances_reports_referrer_chain():
+    """A clean class passes; a module-global leak is reported, with extra_info."""
     obj = _Leaky()
     del obj
     assert_no_instances(_Leaky, when="test")
-
-
-def test_assert_no_instances_reports_referrer_chain(reset_leaky):
-    """A leaked instance held by a module-level global is reported."""
     global _leaked
     _leaked = _Leaky()
     with pytest.raises(AssertionError, match=rf"Found 1 {__name__}\._Leaky @ test"):
         assert_no_instances(_Leaky, when="test")
-
-
-def test_assert_no_instances_extra_info(reset_leaky):
-    """extra_info lines are prepended to a failing instance's report."""
-    global _leaked
-    _leaked = _Leaky()
     with pytest.raises(AssertionError, match="custom-marker"):
         assert_no_instances(
             _Leaky, when="test", extra_info=lambda obj: ["custom-marker"]
@@ -165,26 +158,19 @@ def test_describe_referrer_function_and_module():
     assert next_obj is sys
 
 
-_holder_list: list | None = None
-
-
-@pytest.fixture
-def reset_holder_list():
-    """Clear the module-level _holder_list global on teardown."""
-    yield
-    global _holder_list
-    _holder_list = None
-
-
-def test_module_global_list_is_named(reset_holder_list):
-    """A leaked instance in a module-level list is anchored by its global name."""
-    global _holder_list
+def test_module_global_container_is_named():
+    """A leaked instance in a module-level list/dict is anchored by global name."""
+    global _holder_list, _holder_dict
     _holder_list = [_Leaky()]
     with pytest.raises(AssertionError, match=r"_holder_list\[0\]: list = <len=1>"):
         assert_no_instances(_Leaky, when="test")
+    _holder_list = None
+    _holder_dict = {"k": _Leaky()}
+    with pytest.raises(AssertionError, match=r"_holder_dict\['k'\]: dict = <len=1>"):
+        assert_no_instances(_Leaky, when="test")
 
 
-def test_module_globals_map_skips_broken_modules(monkeypatch, reset_leaky):
+def test_module_globals_map_skips_broken_modules(monkeypatch):
     """Broken sys.modules entries (None, exploding __dict__) are skipped."""
 
     class _EvilDict(dict):
@@ -259,7 +245,7 @@ def test_version_fallback():
     assert refleak.__version__ == real
 
 
-def test_describe_referrer_kinds(reset_leaky):
+def test_describe_referrer_kinds():
     """Bound methods, anonymous objects, and named globals render correctly."""
 
     class _A:
@@ -283,25 +269,6 @@ def test_describe_referrer_kinds(reset_leaky):
     desc, next_obj = _describe_referrer(_leaked, None)
     assert desc == f"{__name__}._leaked: {__name__}._Leaky = {_leaked!r}"
     assert next_obj is None  # a named global is a fully-explained anchor
-
-
-_holder_dict: dict | None = None
-
-
-@pytest.fixture
-def reset_holder_dict():
-    """Clear the module-level _holder_dict global on teardown."""
-    yield
-    global _holder_dict
-    _holder_dict = None
-
-
-def test_module_global_dict_is_named(reset_holder_dict):
-    """A leaked instance in a module-level (plain) dict is anchored by name."""
-    global _holder_dict
-    _holder_dict = {"k": _Leaky()}
-    with pytest.raises(AssertionError, match=r"_holder_dict\['k'\]: dict = <len=1>"):
-        assert_no_instances(_Leaky, when="test")
 
 
 def test_referrer_chain_truncates():
@@ -360,7 +327,7 @@ def test_instance_attribute_anchor():
     assert_no_instances(_Leaky, when="test")
 
 
-def test_two_leaks_render_with_ids(reset_leaky, reset_holder_list):
+def test_two_leaks_render_with_ids():
     """Two survivors render as two sections, each id-tagged.
 
     Run with ``pytest -s`` to eyeball the full rendered failure message.
@@ -378,18 +345,7 @@ def test_two_leaks_render_with_ids(reset_leaky, reset_holder_list):
     assert f"\n_Leaky @ 0x{id(_holder_list[0]):x}:" in msg
 
 
-_saved_exc: Exception | None = None
-
-
-@pytest.fixture
-def reset_saved_exc():
-    """Clear the module-level _saved_exc global on teardown."""
-    yield
-    global _saved_exc
-    _saved_exc = None
-
-
-def test_traceback_frame_leak_detected(reset_saved_exc):
+def test_traceback_frame_leak_detected():
     """An object alive only via a stored traceback's frame is reported.
 
     Live-stack frames are machinery and stay hidden, but a frame kept alive
@@ -468,3 +424,77 @@ def test_fullname_module_vs_class():
     assert _fullname(testing) == "refleak.testing"
     assert _fullname(_Leaky()) == f"{__name__}._Leaky"
     assert _fullname(_Leaky) == f"{__name__}._Leaky"  # classes name themselves
+
+
+def test_snapshot_lifecycle():
+    """Pre-existing instances are ignored; new survivors are reported; ids only."""
+    global _leaked, _holder_list
+    _leaked = _Leaky()  # pre-dates the snapshot
+    with pytest.raises(AssertionError):  # zero-instances check does fail
+        assert_no_instances(_Leaky, when="test")
+    snap = Snapshot(_Leaky)
+    snap.assert_no_new(when="test")  # alive, but nothing *new*
+    _holder_list = [_Leaky()]
+    with pytest.raises(AssertionError) as exc_info:
+        snap.assert_no_new(when="test")
+    msg = str(exc_info.value)
+    assert f"Found 1 new {__name__}._Leaky object @ test:" in msg
+    assert f"\n_Leaky @ 0x{id(_holder_list[0]):x}:" in msg
+    assert "_holder_list[0]" in msg  # the referrer chain names the module global
+    del exc_info
+    # only ids are stored: dropping the leaks makes both checks pass with the
+    # snapshot itself still alive
+    _leaked = _holder_list = None
+    snap.assert_no_new(when="test")
+    assert_no_instances(_Leaky, when="test")
+
+
+def test_snapshot_match_forms_and_labels():
+    """Types, tuples, and predicates all match; labels and plurals render."""
+    snap_label = Snapshot(_Leaky, label="VTK")
+    snap_tuple = Snapshot((_Leaky,))
+    snap_pred = Snapshot(lambda obj: isinstance(obj, _Leaky))
+    global _holder_list
+    _holder_list = [_Leaky(), _Leaky()]
+    with pytest.raises(AssertionError, match=r"Found 2 new VTK objects @ test:"):
+        snap_label.assert_no_new(when="test")
+    with pytest.raises(AssertionError, match=r"Found 2 new \(.*\._Leaky\) objects @"):
+        snap_tuple.assert_no_new(when="test")
+    # a callable adds no adjective to the summary by default
+    with pytest.raises(AssertionError, match=r"Found 2 new objects @ test:"):
+        snap_pred.assert_no_new(when="test")
+
+
+def test_snapshot_match_robustness():
+    """Bad match args fail at construction; a raising predicate is a miss."""
+    with pytest.raises(TypeError, match="tuple must contain only types"):
+        Snapshot((_Leaky, 42))
+    with pytest.raises(TypeError, match="must be a type"):
+        Snapshot(42)
+
+    class _Explosive:
+        pass
+
+    def match(obj):
+        if isinstance(obj, _Explosive):
+            raise ValueError("boom")
+        return isinstance(obj, _Leaky)
+
+    landmine = _Explosive()
+    snap = Snapshot(match)
+    global _leaked
+    _leaked = _Leaky()
+    with pytest.raises(AssertionError, match="Found 1 new object @ test:"):
+        snap.assert_no_new(when="test")
+    del landmine
+
+
+def test_snapshot_objs_extra_info_and_empty_when():
+    """objs= and extra_info= pass through; empty when leaves no dangling @."""
+    snap = Snapshot(_Leaky, collect=False)
+    global _leaked
+    _leaked = _Leaky()
+    with pytest.raises(AssertionError, match="custom-marker"):
+        snap.assert_no_new(when="test", extra_info=lambda obj: ["custom-marker"])
+    with pytest.raises(AssertionError, match=r"Found 1 new .*\._Leaky object:\n"):
+        snap.assert_no_new(objs=[_leaked])

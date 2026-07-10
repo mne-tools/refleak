@@ -380,12 +380,67 @@ def referrer_chain(obj, *, max_depth=5, max_lines=40, exclude_ids=()):
     return _render_tree(nodes), len(nodes) > 0
 
 
-def _found_summary(n, cls, when):
-    """Build the "Found N module.Class [@ when]:" summary line."""
-    out = f"Found {n} {_fullname(cls)}"
+def _found_summary(n, what, when):
+    """Build the "Found N <what> [@ when]:" summary line."""
+    out = f"Found {n} {what}"
     if when:
         out += f" @ {when}"
     return out + ":"
+
+
+def _match_objects(match, objs):
+    """Yield the objects in objs that match, treating a raising check as a miss.
+
+    ``match`` is either a type / tuple of types (checked with ``isinstance``)
+    or a predicate callable. The check runs on arbitrary heap objects, so it
+    can raise for exotic ones (weakref proxies, half-destroyed native
+    wrappers); those are misses, not errors.
+    """
+    if isinstance(match, (type, tuple)):
+        for obj in objs:
+            try:
+                if isinstance(obj, match):
+                    yield obj
+            except Exception:  # such as a weakref
+                pass
+    else:
+        for obj in objs:
+            try:
+                if match(obj):
+                    yield obj
+            except Exception:  # e.g. a predicate poking a dead C++ proxy
+                pass
+
+
+def _build_report(survivors, *, objs, extra_info, max_depth, max_lines):
+    """Build (count, message lines) for survivors, each with a referrer chain.
+
+    Only survivors with at least one non-excluded referrer count: one held
+    alive solely by the traversal's own containers isn't a leak.
+    """
+    n = 0
+    ref = list()
+    for obj in survivors:
+        extra = list(extra_info(obj)) if extra_info is not None else list()
+        lines, has_referrers = referrer_chain(
+            obj,
+            max_depth=max_depth,
+            max_lines=max_lines,
+            exclude_ids={id(objs), id(survivors), id(ref), id(globals())},
+        )
+        if has_referrers:
+            ref.extend(extra)
+            # id() tags just the survivors themselves (not every tree
+            # node): it distinguishes multiple instances of a class from
+            # each other and can be correlated with "<... object at 0x...>"
+            # reprs elsewhere. The summary line already gives the full
+            # class name, so the short name suffices here (while still
+            # revealing subclasses).
+            ref.append(f"{obj.__class__.__qualname__} @ 0x{id(obj):x}:")
+            ref.extend(lines)
+            n += 1
+        del obj
+    return n, ref
 
 
 def assert_no_instances(
@@ -431,35 +486,149 @@ def assert_no_instances(
         (see :func:`referrer_chain`).
     """
     __tracebackhide__ = True
-    n = 0
-    ref = list()
     gc_collect_once(request)
     if objs is None:
         objs = gc.get_objects()
-    for obj in objs:  # e.g., vtkPolyData, Brain, Plotter, etc.
-        try:
-            check = isinstance(obj, cls)
-        except Exception:  # such as a weakref
-            check = False
-        if check:
-            extra = list(extra_info(obj)) if extra_info is not None else list()
-            lines, has_referrers = referrer_chain(
-                obj,
-                max_depth=max_depth,
-                max_lines=max_lines,
-                exclude_ids={id(objs), id(ref), id(globals())},
-            )
-            if has_referrers:
-                ref.extend(extra)
-                # id() tags just the survivors themselves (not every tree
-                # node): it distinguishes multiple instances of cls from each
-                # other and can be correlated with "<... object at 0x...>"
-                # reprs elsewhere. The summary line already gives the full
-                # class name, so the short name suffices here (while still
-                # revealing subclasses of cls).
-                ref.append(f"{obj.__class__.__qualname__} @ 0x{id(obj):x}:")
-                ref.extend(lines)
-                n += 1
-        del obj
-    del objs
-    assert n == 0, "\n" + _found_summary(n, cls, when) + "\n" + "\n".join(ref)
+    survivors = list(_match_objects(cls, objs))  # e.g., vtkPolyData, Brain, ...
+    n, ref = _build_report(
+        survivors,
+        objs=objs,
+        extra_info=extra_info,
+        max_depth=max_depth,
+        max_lines=max_lines,
+    )
+    del objs, survivors
+    assert n == 0, (
+        "\n" + _found_summary(n, _fullname(cls), when) + "\n" + "\n".join(ref)
+    )
+
+
+class Snapshot:
+    """Snapshot of live matching objects, to later assert none *new* survive.
+
+    :func:`assert_no_instances` requires that *zero* instances exist, which is
+    too strict when some legitimately pre-date the code under test (e.g. VTK
+    objects held by a theme or module-level cache). A ``Snapshot`` records the
+    ``id()``\\ s of matching objects up front so :meth:`assert_no_new` can
+    flag only what appeared afterwards and survived garbage collection --
+    the pattern used by ``check_gc``-style pytest fixtures: snapshot before
+    the test body, assert after.
+
+    Only ids are stored, so a ``Snapshot`` itself keeps nothing alive. The
+    unavoidable caveat of id-based snapshotting is id reuse: a new object
+    allocated at a dead pre-existing object's address is indistinguishable
+    from that pre-existing object (a false negative, never a false positive).
+    ``collect=True`` minimizes the window by clearing collectable garbage
+    before ids are recorded.
+
+    Parameters
+    ----------
+    match : type | tuple[type, ...] | callable
+        What counts as a matching object: types are checked with
+        ``isinstance``, anything else is called with each candidate object
+        and should return truthy for a match. A check that raises (e.g. on a
+        weakref proxy or a half-destroyed native wrapper) counts as a miss.
+    label : str | None
+        Adjective for matching objects in the failure summary, e.g. ``"VTK"``
+        renders as ``"Found 2 new VTK objects"``. By default a type (or tuple
+        of types) is named directly and a callable adds nothing (``"Found 2
+        new objects"``).
+    collect : bool
+        Call ``gc.collect()`` before recording ids (default ``True``). Skip
+        only when a collect is prohibitively slow at snapshot time and the
+        increased id-reuse window is acceptable.
+
+    Examples
+    --------
+    >>> from refleak.testing import Snapshot
+    >>> class Widget:
+    ...     pass
+    >>> pre_existing = Widget()  # recorded in the snapshot, never reported
+    >>> snap = Snapshot(Widget)
+    >>> transient = Widget()
+    >>> del transient
+    >>> snap.assert_no_new(when="after test")  # passes
+    """
+
+    def __init__(self, match, *, label=None, collect=True):
+        if isinstance(match, tuple):
+            if not all(isinstance(m, type) for m in match):
+                msg = f"match tuple must contain only types, got {match!r}"
+                raise TypeError(msg)
+        elif not isinstance(match, type) and not callable(match):
+            msg = f"match must be a type, tuple of types, or callable, got {match!r}"
+            raise TypeError(msg)
+        self._match = match
+        if label is None:
+            if isinstance(match, type):
+                label = _fullname(match)
+            elif isinstance(match, tuple):
+                label = "(" + " | ".join(_fullname(m) for m in match) + ")"
+            else:
+                label = ""
+        self._label = label
+        if collect:
+            # A plain collect, not gc_collect_once(request): the once-per-item
+            # deduplication would make this setup-time collect suppress the
+            # teardown-time one in assert_no_new -- the collect that matters.
+            gc.collect()
+        self._before_ids = {id(obj) for obj in _match_objects(match, gc.get_objects())}
+
+    def assert_no_new(
+        self,
+        when="",
+        *,
+        request=None,
+        objs=None,
+        extra_info=None,
+        max_depth=5,
+        max_lines=40,
+    ):
+        """Assert that no matching objects newer than the snapshot are alive.
+
+        For any surviving new object, the failure message includes a rendered
+        referrer chain (see :func:`referrer_chain`) explaining what's still
+        holding a reference to it. Each survivor's section is headed by its
+        type and ``id()`` (in hex, to match default object reprs).
+
+        Parameters
+        ----------
+        when : str
+            A short description of when this check is happening, included in
+            the assertion message (e.g. ``"after test"``).
+        request : pytest.FixtureRequest | None
+            If given, deduplicate the ``gc.collect()`` call across checks
+            within the same test item (see :func:`gc_collect_once`).
+        objs : list | None
+            The result of ``gc.get_objects()`` to check, if already computed
+            by the caller. If ``None``, it is computed here.
+        extra_info : Callable[[object], list[str]] | None
+            If given, called with each surviving object to produce extra
+            lines (e.g. instance-specific diagnostic state) prepended to its
+            entry in the failure message.
+        max_depth : int
+            Maximum number of referrer hops to walk per surviving object
+            (see :func:`referrer_chain`).
+        max_lines : int
+            Maximum number of tree lines to render per surviving object
+            (see :func:`referrer_chain`).
+        """
+        __tracebackhide__ = True
+        gc_collect_once(request)
+        if objs is None:
+            objs = gc.get_objects()
+        before = self._before_ids
+        survivors = [
+            obj for obj in _match_objects(self._match, objs) if id(obj) not in before
+        ]
+        n, ref = _build_report(
+            survivors,
+            objs=objs,
+            extra_info=extra_info,
+            max_depth=max_depth,
+            max_lines=max_lines,
+        )
+        del objs, survivors
+        what = f"new {self._label} object" if self._label else "new object"
+        what += "" if n == 1 else "s"
+        assert n == 0, "\n" + _found_summary(n, what, when) + "\n" + "\n".join(ref)
