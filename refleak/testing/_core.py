@@ -537,6 +537,11 @@ class Snapshot:
         Call ``gc.collect()`` before recording ids (default ``True``). Skip
         only when a collect is prohibitively slow at snapshot time and the
         increased id-reuse window is acceptable.
+    objs : list | None
+        The result of ``gc.get_objects()`` to snapshot, if already computed
+        by the caller. If given, ``collect`` is ignored -- any desired
+        collect must have happened before ``objs`` was computed. If ``None``,
+        it is computed here.
 
     Examples
     --------
@@ -550,7 +555,7 @@ class Snapshot:
     >>> snap.assert_no_new(when="after test")  # passes
     """
 
-    def __init__(self, match, *, label=None, collect=True):
+    def __init__(self, match, *, label=None, collect=True, objs=None):
         if isinstance(match, tuple):
             if not all(isinstance(m, type) for m in match):
                 msg = f"match tuple must contain only types, got {match!r}"
@@ -567,12 +572,15 @@ class Snapshot:
             else:
                 label = ""
         self._label = label
-        if collect:
-            # A plain collect, not gc_collect_once(request): the once-per-item
-            # deduplication would make this setup-time collect suppress the
-            # teardown-time one in assert_no_new -- the collect that matters.
-            gc.collect()
-        self._before_ids = {id(obj) for obj in _match_objects(match, gc.get_objects())}
+        if objs is None:
+            if collect:
+                # A plain collect, not gc_collect_once(request): the
+                # once-per-item deduplication would make this setup-time
+                # collect suppress the teardown-time one in assert_no_new --
+                # the collect that matters.
+                gc.collect()
+            objs = gc.get_objects()
+        self._before_ids = {id(obj) for obj in _match_objects(match, objs)}
 
     def assert_no_new(
         self,
