@@ -42,7 +42,24 @@ top-down:
   `isinstance`, anything else is a predicate callable); `assert_no_new()`
   re-scans and asserts nothing matching appeared since and survived. Stores
   only ids (pins nothing alive); the documented caveat is id reuse (false
-  negatives only), minimized by the constructor's `gc.collect()`.
+  negatives only), which a `gc.collect()` does *not* really fix — CPython
+  hands a just-freed address straight back to the next same-size object.
+- `Snapshot(..., freeze=True)` — the fast, strict alternative: `gc.freeze()`
+  at construction (empty before-set, no collect, no scan) so everything the
+  collector can still see at check time is new by construction. `objs=` is
+  rejected, `collect` is irrelevant. `assert_no_new()` takes
+  `gc.get_objects()` *while frozen* (that is what defines "new"), thaws in a
+  `finally`, and only then matches/reports — `gc.get_referrers()` skips the
+  permanent generation too, so reporting while frozen would hide exactly the
+  pre-existing anchors (module-level registries) that `_build_report` needs
+  to see, and a referrer-less survivor is dropped as "not a leak". A full
+  `gc.get_objects()` is retaken after thawing only when there are survivors,
+  keeping the passing path scan-free. Module-level `_freeze_depth` counts
+  nesting because `gc.unfreeze()` empties the *whole* permanent generation
+  (including CPython's own startup freeze and anyone else's); the public
+  `thaw()` is idempotent, never raises, and only the outermost holder
+  unfreezes. Freezing is process-wide, so all `gc` introspection (anyone's,
+  not just ours) lies for the duration of the window.
 - Both share `_match_objects` (a raising match check counts as a miss) and
   `_build_report` (per-survivor `referrer_chain` + message lines; survivors
   with no non-excluded referrers don't count).

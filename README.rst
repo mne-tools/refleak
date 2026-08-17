@@ -114,6 +114,41 @@ afterwards (and still alive) are reported:
 ``match`` can be a type, a tuple of types, or a predicate callable, and
 failures render the same referrer chains as ``assert_no_instances``.
 
+Freeze mode: faster and stricter snapshots
+------------------------------------------
+
+By default a ``Snapshot`` records the ``id()`` of every matching object,
+which costs a ``gc.collect()`` and a full heap scan up front, plus another
+scan at check time. ``freeze=True`` instead calls ``gc.freeze()``, moving
+every live object into the permanent generation -- which ``gc.get_objects()``
+never reports and the collector never walks -- so at check time everything
+still visible is *by construction* newer than the snapshot:
+
+.. code-block:: python
+
+    @pytest.fixture(autouse=True)
+    def check_vtk_gc(request):
+        snap = Snapshot(is_vtk, label="VTK", freeze=True)
+        try:
+            yield
+            snap.assert_no_new(when="test teardown", request=request)
+        finally:
+            snap.thaw()  # no-op if the check above ran (it thaws itself)
+
+Nothing is recorded and nothing is scanned at snapshot time (~0.1 ms instead
+of ~60 ms on a 180k-object heap; one downstream suite went from 155 s to
+83 s), and the check is also *stricter*: an ``id()`` is an address, and
+CPython readily hands a freed address straight back to the next object of
+the same size, so an id-based snapshot can mistake a genuine leak for the
+pre-existing object it replaced. Freezing has no ids to collide.
+
+The trade-off is that freezing is process-wide until ``thaw()`` (which
+``assert_no_new`` calls for you, on every path including a failing one), and
+for that whole window ``gc.get_objects()`` and ``gc.get_referrers()`` lie to
+*everyone* -- e.g. Hypothesis's ``register_random`` checks reachability with
+``gc.get_referrers()`` and warns spuriously inside a frozen window. Keep the
+frozen window as small as the code under test.
+
 Comparison to similar packages
 -------------------------------
 

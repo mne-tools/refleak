@@ -14,7 +14,7 @@ import pytest
 
 import refleak
 from refleak import testing
-from refleak.testing import Snapshot, assert_no_instances
+from refleak.testing import Snapshot, _core, assert_no_instances
 from refleak.testing._core import (
     _describe_referrer,
     _fullname,
@@ -44,6 +44,23 @@ def _reset_globals():
     yield
     global _leaked, _holder_list, _holder_dict, _hidden_dict, _saved_exc
     _leaked = _holder_list = _holder_dict = _hidden_dict = _saved_exc = None
+
+
+@pytest.fixture(autouse=True)
+def _unfrozen_heap():
+    """Guarantee no test can leave the process heap frozen behind it.
+
+    The freeze-mode tests drive the machinery by hand, so an assertion
+    failing partway through one of them can strand a freeze: the nesting
+    counter never gets decremented, ``gc.unfreeze()`` is never reached, and
+    every later test silently runs against a frozen (i.e. lying) heap --
+    which degrades unrelated checks instead of failing loudly. Autouse and
+    unconditional (rather than a try/finally per test) so that this holds for
+    tests that don't even mean to freeze, and for any added later.
+    """
+    yield
+    _core._freeze_depth = 0
+    gc.unfreeze()
 
 
 class _GhostlyOwner:
@@ -549,3 +566,135 @@ def test_snapshot_objs_extra_info_and_empty_when():
     snap_empty = Snapshot(_Leaky, objs=[])
     with pytest.raises(AssertionError, match="Found 1 new"):
         snap_empty.assert_no_new(when="test")
+
+
+def test_snapshot_freeze_catches_reused_address():
+    """A leak allocated at a dead object's address is caught only by freezing.
+
+    CPython's allocator hands back the most recently freed block of a size
+    class, so a new object created right after a same-sized one died lands at
+    that same address -- and an id-based snapshot, which knows objects only by
+    address, cannot tell it apart from the object it replaced. Freezing has no
+    ids to collide.
+    """
+    global _holder_list
+    # Get a pool of this size class to the front of the allocator's free
+    # lists first: whether an *arbitrary* freed block is handed straight back
+    # depends on what earlier tests left behind, and this test is about what
+    # happens once it is.
+    warmup = [_Leaky() for _ in range(64)]
+    del warmup
+    doomed = _Leaky()
+    doomed_id = id(doomed)
+    # objs= (rather than a full scan) so that recording the id disturbs the
+    # allocator as little as possible -- reuse of doomed's block below is the
+    # whole point of the test
+    ids_snap = Snapshot(_Leaky, objs=[doomed], collect=False)
+    snap = Snapshot(_Leaky, freeze=True)
+    assert gc.get_freeze_count() > 0
+    del doomed
+    _holder_list = [_Leaky()]  # allocated straight into the freed block
+    leaked_id = id(_holder_list[0])
+    with pytest.raises(AssertionError) as exc_info:
+        snap.assert_no_new(when="test")
+    msg = str(exc_info.value)
+    assert f"Found 1 new {__name__}._Leaky object @ test:" in msg
+    assert f"\n_Leaky @ 0x{leaked_id:x}:" in msg
+    assert "_holder_list[0]" in msg
+    # even the failing path thaws
+    assert gc.get_freeze_count() == 0
+    del exc_info
+    # The leak really did land on the dead object's address ...
+    assert leaked_id == doomed_id
+    # ... which is precisely why the id-based snapshot sees nothing new.
+    ids_snap.assert_no_new(when="test")
+
+
+def test_snapshot_freeze_thaws_before_reporting():
+    """A survivor anchored by a pre-freeze container is still reported.
+
+    ``gc.get_referrers()`` skips the permanent generation, so while frozen
+    this leak's only anchor is invisible and the survivor looks referrer-less
+    -- i.e. not a leak at all. The check must therefore thaw before building
+    the report.
+    """
+    global _holder_list
+    _holder_list = []  # the "registry" pre-dates (and so gets frozen by) the snapshot
+    snap = Snapshot(_Leaky, freeze=True)
+    leak = _Leaky()
+    _holder_list.append(leak)
+    # while frozen the anchor is invisible, which is exactly the trap
+    assert not any(r is _holder_list for r in gc.get_referrers(leak))
+    del leak
+    with pytest.raises(AssertionError) as exc_info:
+        snap.assert_no_new(when="test")
+    msg = str(exc_info.value)
+    assert f"{__name__}._holder_list[0]: list = <len=1>" in msg
+    # ... and it is the *only* anchor: the frozen-time gc.get_objects() list
+    # must not survive into the post-thaw rescan and show up as a bogus
+    # anonymous-list referrer of its own survivors.
+    assert "├──" not in msg
+    assert gc.get_freeze_count() == 0
+    del exc_info
+
+
+def test_snapshot_freeze_nests():
+    """An inner freeze-mode snapshot must not thaw the heap out from under the outer.
+
+    ``gc.unfreeze()`` empties the whole permanent generation, so only the
+    outermost snapshot may call it (nested in-process pytest sessions really
+    do produce this shape).
+
+    ``gc.get_freeze_count()`` is a live census of the permanent generation,
+    not a count of freeze calls: it drops whenever a frozen object is
+    refcount-deallocated, so "still frozen" can only be asserted as "more
+    than the pre-freeze baseline", never as an exact (or even unchanged)
+    number. "Thawed" is exact, because ``gc.unfreeze()`` empties it outright.
+    """
+    baseline = gc.get_freeze_count()
+    outer = Snapshot(_Leaky, freeze=True)
+    assert gc.get_freeze_count() > baseline
+    inner = Snapshot(_Leaky, freeze=True)
+    inner.assert_no_new(when="inner")  # nothing new: passes, and thaws inner
+    assert gc.get_freeze_count() > baseline  # ... but the heap is still frozen
+    outer.assert_no_new(when="outer")
+    assert gc.get_freeze_count() == 0
+
+
+def test_snapshot_thaw_is_idempotent():
+    """thaw() can be called any number of times, on any snapshot."""
+    Snapshot(_Leaky).thaw()  # a no-op for an id-based snapshot
+    assert gc.get_freeze_count() == 0
+    snap = Snapshot(_Leaky, freeze=True)
+    assert gc.get_freeze_count() > 0
+    snap.thaw()
+    assert gc.get_freeze_count() == 0
+    snap.thaw()  # the second thaw must not unbalance the nesting counter
+    assert gc.get_freeze_count() == 0
+    other = Snapshot(_Leaky, freeze=True)  # so this one still freezes ...
+    assert gc.get_freeze_count() > 0
+    other.assert_no_new(when="test")  # ... and still thaws
+    assert gc.get_freeze_count() == 0
+
+
+def test_snapshot_freeze_rejects_objs():
+    """objs= is meaningless when freezing, and rejecting it must not freeze."""
+    with pytest.raises(TypeError, match="objs= cannot be combined with freeze=True"):
+        Snapshot(_Leaky, freeze=True, objs=[])
+    assert gc.get_freeze_count() == 0  # validation happens before any freeze
+
+
+def test_snapshot_freeze_second_check_is_zero_tolerance():
+    """Once thawed, the empty before-set makes a re-check strict, not blind.
+
+    A freeze-mode snapshot is single-use; a second check sees the (now
+    unfrozen) pre-existing objects too, so it over-reports rather than
+    silently missing anything.
+    """
+    global _leaked
+    _leaked = _Leaky()  # pre-dates the snapshot
+    snap = Snapshot(_Leaky, freeze=True)
+    snap.assert_no_new(when="test")  # passes: nothing new
+    with pytest.raises(AssertionError, match="Found 1 new"):
+        snap.assert_no_new(when="test")
+    assert gc.get_freeze_count() == 0

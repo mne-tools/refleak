@@ -9,6 +9,12 @@ import inspect
 import sys
 import types
 
+# How many freeze-mode Snapshots currently hold the heap frozen. gc.unfreeze()
+# empties the *entire* permanent generation -- ours and anything any other
+# actor froze alike -- so it can only be called once the outermost holder is
+# done (see Snapshot.thaw).
+_freeze_depth = 0
+
 
 def _fullname(obj):
     if inspect.ismodule(obj):
@@ -578,11 +584,16 @@ class Snapshot:
     the test body, assert after.
 
     Only ids are stored, so a ``Snapshot`` itself keeps nothing alive. The
-    unavoidable caveat of id-based snapshotting is id reuse: a new object
-    allocated at a dead pre-existing object's address is indistinguishable
-    from that pre-existing object (a false negative, never a false positive).
-    ``collect=True`` minimizes the window by clearing collectable garbage
-    before ids are recorded.
+    unavoidable caveat of id-based snapshotting is id reuse: an ``id()`` is an
+    address, and CPython's allocator hands back the *most recently freed*
+    block of a size class, so an object created right after a pre-existing
+    one of the same size died is very likely (measured: 199 times out of 200
+    in a tight loop) to land at exactly that address -- where it is
+    indistinguishable from the object it replaced and is silently not
+    reported. That is a false negative, never a false positive, and
+    ``collect=True`` does not really fix it: collecting *frees* pre-existing
+    objects, which is what creates the reusable addresses in the first place.
+    ``freeze=True`` has no ids to collide and no such window (see `Notes`).
 
     Parameters
     ----------
@@ -599,12 +610,57 @@ class Snapshot:
     collect : bool
         Call ``gc.collect()`` before recording ids (default ``True``). Skip
         only when a collect is prohibitively slow at snapshot time and the
-        increased id-reuse window is acceptable.
+        increased id-reuse window is acceptable. Ignored with ``freeze=True``
+        (nothing is recorded, so there is nothing for a collect to affect).
     objs : list | None
         The result of ``gc.get_objects()`` to snapshot, if already computed
         by the caller. If given, ``collect`` is ignored -- any desired
         collect must have happened before ``objs`` was computed. If ``None``,
-        it is computed here.
+        it is computed here. Not allowed with ``freeze=True``.
+    freeze : bool
+        Use ``gc.freeze()`` instead of recording ids (default ``False``);
+        faster and stricter, at the cost of a process-wide frozen heap until
+        :meth:`thaw` (see `Notes`).
+
+    Notes
+    -----
+    ``freeze=True`` replaces the id bookkeeping with ``gc.freeze()``, which
+    moves every currently-live object into the permanent generation. Neither
+    ``gc.get_objects()`` nor ``gc.get_referrers()`` reports
+    permanent-generation objects and the collector never walks them, so at
+    check time everything the collector can still see is *by construction*
+    newer than the snapshot: the before-set is empty, and no ``gc.collect()``
+    and no heap scan are needed at snapshot time (hence ``collect`` and
+    ``objs`` do not apply; passing ``objs`` with ``freeze=True`` is a
+    ``TypeError``). On a ~180k-object heap that is ~0.1 ms instead of ~60 ms
+    per check, which took one downstream test suite from 155 s to 83 s.
+
+    :meth:`assert_no_new` takes its ``gc.get_objects()`` snapshot while still
+    frozen (that snapshot is what "new" *means*), then thaws *before* matching
+    and reporting: while frozen, a survivor whose only anchor is a container
+    that pre-dates the freeze (any module-level registry or cache) looks like
+    it has no referrers at all, and a survivor with no referrers is
+    deliberately not reported as a leak. On the failure path only, the heap is
+    re-scanned after thawing so referrer chains see all of it; the passing
+    path stays scan-free.
+
+    .. warning::
+        Freezing is process-wide and lasts until :meth:`thaw` (which
+        :meth:`assert_no_new` calls for you). For that whole window *every*
+        consumer of ``gc`` introspection sees a heap that lies -- e.g.
+        Hypothesis's ``register_random`` checks reachability with
+        ``gc.get_referrers()`` and emits a spurious "looks collectable"
+        warning if it runs inside a frozen window. Keep the window as small
+        as the code under test, and call :meth:`thaw` on any path that bails
+        out before the check.
+
+    Freeze mode nests: an inner freeze-mode ``Snapshot`` (e.g. one taken by a
+    nested in-process pytest session) freezes again, and only the outermost
+    :meth:`thaw` actually calls ``gc.unfreeze()`` -- which empties the whole
+    permanent generation, everyone else's freezes included. The inner freeze
+    absorbs objects created since the outer one, so the outer check can no
+    longer report those: nesting trades some of the outer check's coverage
+    for a correct inner one.
 
     Examples
     --------
@@ -616,9 +672,17 @@ class Snapshot:
     >>> transient = Widget()
     >>> del transient
     >>> snap.assert_no_new(when="after test")  # passes
+
+    Freeze mode looks the same, but the heap is frozen in between (so the
+    check must always be reached, or :meth:`thaw` called instead):
+
+    >>> snap = Snapshot(Widget, freeze=True)
+    >>> transient = Widget()
+    >>> del transient
+    >>> snap.assert_no_new(when="after test")  # thaws, then passes
     """
 
-    def __init__(self, match, *, label=None, collect=True, objs=None):
+    def __init__(self, match, *, label=None, collect=True, objs=None, freeze=False):
         if isinstance(match, tuple):
             if not all(isinstance(m, type) for m in match):
                 msg = f"match tuple must contain only types, got {match!r}"
@@ -635,15 +699,63 @@ class Snapshot:
             else:
                 label = ""
         self._label = label
-        if objs is None:
-            if collect:
-                # A plain collect, not gc_collect_once(request): the
-                # once-per-item deduplication would make this setup-time
-                # collect suppress the teardown-time one in assert_no_new --
-                # the collect that matters.
-                gc.collect()
-            objs = gc.get_objects()
-        self._before_ids = {id(obj) for obj in _match_objects(match, objs)}
+        self._frozen = False
+        if not freeze:
+            if objs is None:
+                if collect:
+                    # A plain collect, not gc_collect_once(request): the
+                    # once-per-item deduplication would make this setup-time
+                    # collect suppress the teardown-time one in assert_no_new
+                    # -- the collect that matters.
+                    gc.collect()
+                objs = gc.get_objects()
+            self._before_ids = {id(obj) for obj in _match_objects(match, objs)}
+            return
+        if objs is not None:
+            msg = (
+                "objs= cannot be combined with freeze=True: the frozen heap "
+                "itself is what defines the before-set"
+            )
+            raise TypeError(msg)
+        # Everything the collector can still see after this is newer than the
+        # snapshot, so there is nothing to record (and no reason to collect or
+        # scan -- that is the whole speed win).
+        self._before_ids = set()
+        # Freeze last and account for it immediately: anything raising between
+        # gc.freeze() and the bookkeeping below would leave the process heap
+        # frozen with nobody able to thaw it.
+        global _freeze_depth
+        gc.freeze()
+        _freeze_depth += 1
+        self._frozen = True
+
+    def thaw(self):
+        """Undo this snapshot's ``gc.freeze()``, if it made one.
+
+        Idempotent, safe on a non-freeze snapshot, and never raises -- it runs
+        from :meth:`assert_no_new` while an assertion may be in flight, and
+        from user-written abort paths (a fixture bailing out before the
+        check). ``gc.unfreeze()`` empties the whole permanent generation, so
+        it happens only once the outermost freeze-mode snapshot is done; an
+        inner one merely gives up its claim.
+
+        To check the result, note that ``gc.get_freeze_count()`` is a live
+        census of the permanent generation rather than a count of freezes: it
+        drops as frozen objects are refcount-deallocated, so being frozen can
+        only be tested as "above the pre-freeze baseline". Being thawed *is*
+        exact -- ``gc.get_freeze_count() == 0`` -- since unfreezing empties
+        that generation outright.
+        """
+        if not self._frozen:  # never froze, or already thawed
+            return
+        self._frozen = False
+        global _freeze_depth
+        _freeze_depth = max(_freeze_depth - 1, 0)
+        if _freeze_depth == 0:
+            try:
+                gc.unfreeze()
+            except Exception:  # pragma: no cover
+                pass
 
     def assert_no_new(
         self,
@@ -662,6 +774,14 @@ class Snapshot:
         holding a reference to it. Each survivor's section is headed by its
         type and ``id()`` (in hex, to match default object reprs).
 
+        A freeze-mode snapshot is thawed here, on every path (including a
+        failing assertion), so it is effectively single-use: with the heap
+        thawed its empty before-set no longer means "nothing pre-existed", and
+        a second call therefore degenerates into an
+        :func:`assert_no_instances`-style "no matching objects at all" check.
+        That errs toward over-reporting, never toward missing a leak; take a
+        fresh ``Snapshot`` per check instead.
+
         Parameters
         ----------
         when : str
@@ -672,7 +792,11 @@ class Snapshot:
             within the same test item (see :func:`gc_collect_once`).
         objs : list | None
             The result of ``gc.get_objects()`` to check, if already computed
-            by the caller. If ``None``, it is computed here.
+            by the caller. If ``None``, it is computed here (in freeze mode,
+            while the heap is still frozen -- which is what makes everything
+            in it new). Passing it in freeze mode is allowed but bypasses
+            that: the snapshot is still thawed, and the given objects are
+            checked as-is.
         extra_info : Callable[[object], list[str]] | None
             If given, called with each surviving object to produce extra
             lines (e.g. instance-specific diagnostic state) prepended to its
@@ -685,13 +809,36 @@ class Snapshot:
             (see :func:`referrer_chain`).
         """
         __tracebackhide__ = True
-        gc_collect_once(request)
-        if objs is None:
-            objs = gc.get_objects()
+        # In freeze mode this snapshot is what "new" means: the objects the
+        # collector can still see while frozen are exactly the ones created
+        # since. Everything after it runs thawed -- a finally so no failure
+        # path can leave the process heap frozen forever.
+        frozen_objs = objs is None and self._frozen
+        try:
+            gc_collect_once(request)
+            if objs is None:
+                objs = gc.get_objects()
+        finally:
+            # Thaw before matching and reporting: gc.get_referrers() skips the
+            # permanent generation just like gc.get_objects() does, so while
+            # frozen a survivor anchored only by a pre-existing container (a
+            # module-level registry, say) looks referrer-less -- and a
+            # referrer-less survivor is deliberately not reported as a leak.
+            self.thaw()
         before = self._before_ids
         survivors = [
             obj for obj in _match_objects(self._match, objs) if id(obj) not in before
         ]
+        if survivors and frozen_objs:
+            # Only the failure path pays for a full heap scan (keeping the
+            # passing path scan-free is the point of freeze mode): the frozen
+            # snapshot above holds only post-freeze objects, which is too
+            # narrow a view for _dict_owner's fallback scan. Drop the frozen
+            # snapshot *before* rescanning: alive, it would land in the new
+            # scan (which only excludes its own id) and show up in every
+            # survivor's report as a bogus anonymous-list anchor.
+            del objs
+            objs = gc.get_objects()
         n, ref = _build_report(
             survivors,
             objs=objs,
