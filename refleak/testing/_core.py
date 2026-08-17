@@ -742,9 +742,13 @@ class Snapshot:
         To check the result, note that ``gc.get_freeze_count()`` is a live
         census of the permanent generation rather than a count of freezes: it
         drops as frozen objects are refcount-deallocated, so being frozen can
-        only be tested as "above the pre-freeze baseline". Being thawed *is*
-        exact -- ``gc.get_freeze_count() == 0`` -- since unfreezing empties
-        that generation outright.
+        only be tested as "above the pre-freeze baseline". Unfreezing empties
+        that generation outright, so the count is 0 immediately afterwards --
+        but on CPython 3.12 (alone) every full collection parks the
+        interpreter's few hundred immortal objects (static types and the
+        like) back into it, with no freeze in effect, so once a collect has
+        run a thawed heap reads as that small stable per-process baseline
+        rather than 0.
         """
         if not self._frozen:  # never froze, or already thawed
             return

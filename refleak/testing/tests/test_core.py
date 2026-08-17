@@ -46,6 +46,18 @@ def _reset_globals():
     _leaked = _holder_list = _holder_dict = _hidden_dict = _saved_exc = None
 
 
+# CPython 3.12 (alone: 3.10, 3.11, 3.13, and 3.14 all read 0) parks the
+# interpreter's own immortal objects (static types and the like, ~375 of them)
+# in the permanent generation on every full collection, even with no
+# gc.freeze() in effect -- the process even starts that way. So once any
+# collect has run on an unfrozen heap, "the heap is thawed" cannot be asserted
+# as a freeze count of exactly zero, only as "no more than this baseline",
+# measured here at import time on an unfrozen heap. Stable within a process:
+# immortal objects never die, and the set is fixed at startup.
+gc.collect()
+_IMMORTAL_FREEZE_COUNT = gc.get_freeze_count()
+
+
 @pytest.fixture(autouse=True)
 def _unfrozen_heap():
     """Guarantee no test can leave the process heap frozen behind it.
@@ -591,7 +603,7 @@ def test_snapshot_freeze_catches_reused_address():
     # whole point of the test
     ids_snap = Snapshot(_Leaky, objs=[doomed], collect=False)
     snap = Snapshot(_Leaky, freeze=True)
-    assert gc.get_freeze_count() > 0
+    assert gc.get_freeze_count() > _IMMORTAL_FREEZE_COUNT
     del doomed
     _holder_list = [_Leaky()]  # allocated straight into the freed block
     leaked_id = id(_holder_list[0])
@@ -602,7 +614,7 @@ def test_snapshot_freeze_catches_reused_address():
     assert f"\n_Leaky @ 0x{leaked_id:x}:" in msg
     assert "_holder_list[0]" in msg
     # even the failing path thaws
-    assert gc.get_freeze_count() == 0
+    assert gc.get_freeze_count() <= _IMMORTAL_FREEZE_COUNT
     del exc_info
     # The leak really did land on the dead object's address ...
     assert leaked_id == doomed_id
@@ -634,7 +646,7 @@ def test_snapshot_freeze_thaws_before_reporting():
     # must not survive into the post-thaw rescan and show up as a bogus
     # anonymous-list referrer of its own survivors.
     assert "├──" not in msg
-    assert gc.get_freeze_count() == 0
+    assert gc.get_freeze_count() <= _IMMORTAL_FREEZE_COUNT
     del exc_info
 
 
@@ -649,7 +661,8 @@ def test_snapshot_freeze_nests():
     not a count of freeze calls: it drops whenever a frozen object is
     refcount-deallocated, so "still frozen" can only be asserted as "more
     than the pre-freeze baseline", never as an exact (or even unchanged)
-    number. "Thawed" is exact, because ``gc.unfreeze()`` empties it outright.
+    number. And "thawed" is only "at most the interpreter's own immortals"
+    (see ``_IMMORTAL_FREEZE_COUNT``), not exactly zero.
     """
     baseline = gc.get_freeze_count()
     outer = Snapshot(_Leaky, freeze=True)
@@ -658,30 +671,33 @@ def test_snapshot_freeze_nests():
     inner.assert_no_new(when="inner")  # nothing new: passes, and thaws inner
     assert gc.get_freeze_count() > baseline  # ... but the heap is still frozen
     outer.assert_no_new(when="outer")
-    assert gc.get_freeze_count() == 0
+    assert gc.get_freeze_count() <= _IMMORTAL_FREEZE_COUNT
 
 
 def test_snapshot_thaw_is_idempotent():
     """thaw() can be called any number of times, on any snapshot."""
+    # The id-based constructor's gc.collect() runs on an unfrozen heap, which
+    # on 3.12 parks the immortals -- exactly why "thawed" is <=, never == 0.
     Snapshot(_Leaky).thaw()  # a no-op for an id-based snapshot
-    assert gc.get_freeze_count() == 0
+    assert gc.get_freeze_count() <= _IMMORTAL_FREEZE_COUNT
     snap = Snapshot(_Leaky, freeze=True)
-    assert gc.get_freeze_count() > 0
+    assert gc.get_freeze_count() > _IMMORTAL_FREEZE_COUNT
     snap.thaw()
-    assert gc.get_freeze_count() == 0
+    assert gc.get_freeze_count() <= _IMMORTAL_FREEZE_COUNT
     snap.thaw()  # the second thaw must not unbalance the nesting counter
-    assert gc.get_freeze_count() == 0
+    assert gc.get_freeze_count() <= _IMMORTAL_FREEZE_COUNT
     other = Snapshot(_Leaky, freeze=True)  # so this one still freezes ...
-    assert gc.get_freeze_count() > 0
+    assert gc.get_freeze_count() > _IMMORTAL_FREEZE_COUNT
     other.assert_no_new(when="test")  # ... and still thaws
-    assert gc.get_freeze_count() == 0
+    assert gc.get_freeze_count() <= _IMMORTAL_FREEZE_COUNT
 
 
 def test_snapshot_freeze_rejects_objs():
     """objs= is meaningless when freezing, and rejecting it must not freeze."""
     with pytest.raises(TypeError, match="objs= cannot be combined with freeze=True"):
         Snapshot(_Leaky, freeze=True, objs=[])
-    assert gc.get_freeze_count() == 0  # validation happens before any freeze
+    # validation happens before any freeze
+    assert gc.get_freeze_count() <= _IMMORTAL_FREEZE_COUNT
 
 
 def test_snapshot_freeze_second_check_is_zero_tolerance():
@@ -697,4 +713,4 @@ def test_snapshot_freeze_second_check_is_zero_tolerance():
     snap.assert_no_new(when="test")  # passes: nothing new
     with pytest.raises(AssertionError, match="Found 1 new"):
         snap.assert_no_new(when="test")
-    assert gc.get_freeze_count() == 0
+    assert gc.get_freeze_count() <= _IMMORTAL_FREEZE_COUNT

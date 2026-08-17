@@ -59,7 +59,12 @@ top-down:
   (including CPython's own startup freeze and anyone else's); the public
   `thaw()` is idempotent, never raises, and only the outermost holder
   unfreezes. Freezing is process-wide, so all `gc` introspection (anyone's,
-  not just ours) lies for the duration of the window.
+  not just ours) lies for the duration of the window. Testing note: on
+  CPython 3.12 (alone) every full `gc.collect()` parks the interpreter's
+  ~375 immortal objects in the permanent generation even with no freeze in
+  effect, so "thawed" can only be asserted as `gc.get_freeze_count() <=`
+  that per-process baseline (`_IMMORTAL_FREEZE_COUNT` in the tests), never
+  `== 0`; "frozen" as `>` it.
 - Both share `_match_objects` (a raising match check counts as a miss) and
   `_build_report` (per-survivor `referrer_chain` + message lines; survivors
   with no non-excluded referrers don't count).
